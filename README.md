@@ -95,6 +95,46 @@ On `/newsession`, the outgoing conversation is run through Claude with an extrac
 - Google OAuth tokens (`token_work.pickle`, `credentials.json`), the memory database, vector index, and conversation history are all gitignored — they contain personal data.
 - Gmail scope is read-only; Calendar is read-write by design.
 
+## Hardware
+
+Dot runs on a used **Dell OptiPlex 7060 micro** sitting on a shelf at home — an Intel i5-8500T (6 cores, 35W low-power variant), 16 GB RAM, 500 GB NVMe SSD. Machines like this go for **$100–150 used** on eBay, and the whole stack barely registers on it: load average sits near zero, and disk usage for the project (databases, vector index, venv, embedding model) is a couple of GB.
+
+What actually drives the requirements:
+
+- **RAM** is the binding constraint. The bot holds the sentence-transformers embedding model and ChromaDB in memory — about **1.1 GB resident** in steady state, and the cron ingestion job briefly loads a second copy while it runs. 4 GB works; 8 GB is comfortable.
+- **CPU** barely matters. Embedding with MiniLM on CPU takes milliseconds per memory; everything heavy happens on Anthropic's side. No GPU involved anywhere.
+- **Disk**: a few GB. The SQLite database grows by roughly a kilobyte per memory.
+
+Anything always-on works: an old desktop or laptop, an Intel NUC, a Raspberry Pi 5 (8 GB), or a basic **$5–10/month VPS** with 2–4 GB of RAM if you'd rather not run hardware at all. Power draw for a mini PC like this is ~10 W at idle — roughly **$1–2/month** in electricity.
+
+## Running costs
+
+The design keeps recurring costs low on purpose: embeddings are computed locally (free), big spreadsheets are ingested without any model calls, and aggressive prompt caching means most input tokens bill at a tenth of the normal rate.
+
+**Claude API** (the only metered cost) — Dot uses Claude Sonnet 4.6 at $3/M input tokens, $15/M output, $3.75/M cache writes, and $0.30/M cache reads. Real numbers from one evening of active use (23 API calls — a normal back-and-forth session with tool use):
+
+| Usage | Tokens | Cost |
+|---|---:|---:|
+| Uncached input | 50 | ~$0.00 |
+| Cache writes | 102,470 | $0.38 |
+| Cache reads | 733,767 | $0.22 |
+| Output | 11,169 | $0.17 |
+| **Total for the session** | | **~$0.77** |
+
+That's about **3¢ per API call**. A substantive question usually triggers 2–4 calls (the agent loop searches, reads, then answers), so figure **5–15¢ per real question**. Without prompt caching the same session would have cost roughly 3× more — the cache-read column is the system prompt, tools, and conversation history being replayed at 10% price on every turn.
+
+Ingestion costs scale with what you drop in the Dropbox folder:
+
+- **Designed pitch decks** (image-based PDFs sent to Claude natively): roughly **$0.10–0.20 per deck** — page images dominate the input tokens.
+- **Text documents** (reports, notes, DOCX): a **cent or two** each.
+- **Large spreadsheets/CSVs**: **$0** — 50+ row files are ingested row-by-row with no model call.
+
+A realistic monthly total for daily use — a handful of questions a day plus a few documents a week — lands around **$10–25/month** in API spend. Heavy research days might add a dollar or two.
+
+Everything else is free or already paid for: Telegram bots are free, Google Workspace APIs are free at this scale, the Dropbox API works on a free account, and the embedding model runs locally. The one exception: **Granola's public API requires their Enterprise plan**, so the meeting-notes integration only works if you (or your company) already pay for that — drop those two tools from `agent.py` otherwise.
+
+**Bottom line:** ~$150 once for hardware (or skip it for a cheap VPS), and roughly **$11–27/month** all-in (API + electricity) for a personal agent that's always on.
+
 ## Setup
 
 ### 1. Install
