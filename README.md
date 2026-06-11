@@ -55,6 +55,14 @@ These are the parts that took real debugging to get right.
 
 Every memory lives in SQLite (source of truth) and is embedded into a persistent ChromaDB collection. On each user message, the top-k (15) most similar memories are retrieved and injected into the user turn inside `<relevant_memories>` tags — *not* into the system prompt, deliberately (see caching below). A startup migration (`migrate_sqlite_to_chroma`) backfills any SQLite rows missing from the vector index, so the two stores can never permanently drift.
 
+### Embedding model
+
+All vector embeddings come from [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) via sentence-transformers — a ~80 MB model producing 384-dimensional vectors, running entirely on CPU. It embeds a memory in milliseconds on a modest desktop chip, needs no GPU, no API key, and no Hugging Face account, which is why retrieval costs nothing per query. The trade-off is retrieval quality a notch below large hosted embedding models — fine for a personal memory store of thousands of facts, where the top-15 recall feeds a model that can judge relevance itself.
+
+On first launch, sentence-transformers downloads the weights from the Hugging Face Hub and caches them locally (`~/.cache/huggingface`), so the first start needs internet access and takes a minute. You may see a *"sending unauthenticated requests to the HF Hub"* warning — it's harmless; anonymous downloads of public models are fine, and subsequent starts load from the cache. The loaded model accounts for most of the bot's ~1.1 GB memory footprint.
+
+**Swapping the model:** embeddings from different models aren't comparable, so if you change `SentenceTransformer('all-MiniLM-L6-v2')` in `memory.py`, the existing ChromaDB index becomes garbage. The recovery is built in: delete the `chroma_db/` directory and restart — `migrate_sqlite_to_chroma()` re-embeds every memory from SQLite (the source of truth) into a fresh index on startup.
+
 ### Prompt caching that actually hits
 
 The system prompt and tool definitions are frozen with a `cache_control` breakpoint, so they cache for the whole session. Volatile content (retrieved memories) goes into user turns where it can't invalidate that prefix. A second breakpoint is placed on the last content block of each request — on a *copy* of the message, never the stored history, because markers accumulating in history would blow past the API's 4-breakpoint limit. Result: conversation prefixes cache turn-over-turn; the logs report `cache_read` tokens on every call as a health check.
@@ -145,6 +153,8 @@ venv/bin/pip install -r requirements.txt
 ```
 
 Optional: install Ghostscript (`apt install ghostscript`) for oversized-PDF compression during ingestion.
+
+Note: the first launch downloads the ~80 MB embedding model from the Hugging Face Hub (see [Embedding model](#embedding-model)) — it needs internet access and takes a minute, then loads from local cache thereafter.
 
 ### 2. Configure secrets
 
