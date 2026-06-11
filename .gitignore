@@ -1,0 +1,26 @@
+# Secrets & credentials — never commit
+.env
+.dot
+.dot.env
+credentials.json
+*.pickle
+
+# Personal data stores (memories, conversation history, vector index)
+dot.db
+dot.db.*
+session.json
+session.json.*
+chroma_db/
+chroma_db.corrupt/
+
+# Runtime artifacts
+ingest.log
+.ingest.lock
+__pycache__/
+*.pyc
+
+# Environment
+venv/
+
+# Local tooling config
+.claude/
