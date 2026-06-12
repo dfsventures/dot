@@ -46,6 +46,8 @@ dbx = dbx_lib.Dropbox(
 from memory import (
     save_memory, delete_memory, get_all_memories,
     retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array,
+    set_reminder as _set_reminder, get_due_reminders, delete_reminder as _delete_reminder,
+    list_reminders as _list_reminders,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -395,6 +397,20 @@ def search_dropbox(query: str, max_results: int = 10):
     except Exception as e:
         return f"Dropbox search error: {e}"
 
+def set_reminder(note: str, due_at: str) -> str:
+    r = _set_reminder(note, due_at)
+    return f"Reminder set: '{r['note']}' at {r['due_at']} (ID {r['id']})"
+
+def list_reminders() -> str:
+    reminders = _list_reminders()
+    if not reminders:
+        return "No reminders set."
+    return "\n".join(f"ID {r['id']}: {r['note']} — due {r['due_at']}" for r in reminders)
+
+def delete_reminder(reminder_id: int) -> str:
+    _delete_reminder(reminder_id)
+    return f"Reminder {reminder_id} deleted."
+
 def read_dropbox_file(file_path: str):
     try:
         metadata, response = dbx.files_download(file_path)
@@ -504,6 +520,26 @@ TOOLS = [
         "name": "read_dropbox_file",
         "description": "Download and read a Dropbox file by its full path (get path from search_dropbox first). Supports PDF, DOCX, TXT, MD.",
         "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
+    },
+    {
+        "name": "set_reminder",
+        "description": "Set a reminder that fires as a Telegram message at the specified time. Use when Joey says 'remind me to...', 'follow up with X in N days', 'ping me about Y on [date]'. Always confirm the note text and time before setting.",
+        "input_schema": {"type": "object", "properties": {
+            "note":   {"type": "string", "description": "What to remind about — be specific, e.g. 'Follow up with Jane Doe re Series A deck'"},
+            "due_at": {"type": "string", "description": "When to fire, format: YYYY-MM-DD HH:MM (Toronto local time)"}
+        }, "required": ["note", "due_at"]}
+    },
+    {
+        "name": "list_reminders",
+        "description": "List all pending reminders with their IDs and due times.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "delete_reminder",
+        "description": "Delete a pending reminder by its ID (get IDs from list_reminders).",
+        "input_schema": {"type": "object", "properties": {
+            "reminder_id": {"type": "integer"}
+        }, "required": ["reminder_id"]}
     }
 ]
 
@@ -519,6 +555,9 @@ TOOL_FUNCTIONS = {
     "read_granola":         read_granola,
     "search_dropbox":       search_dropbox,
     "read_dropbox_file":    read_dropbox_file,
+    "set_reminder":         set_reminder,
+    "list_reminders":       list_reminders,
+    "delete_reminder":      delete_reminder,
 }
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -533,6 +572,7 @@ Your tools and what they contain:
 - search_granola / read_granola: Call and meeting notes from Granola
 - search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
 - web_search: Real-time web search
+- set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
 
 When a question involves a person or company, search Granola first (most recent call context),
 then work email. For documents, search Dropbox. For scheduling questions, check calendar.
@@ -757,6 +797,16 @@ async def error_handler(update, context):
         except Exception:
             pass
 
+# ── REMINDER CHECKER (runs every 60s via JobQueue) ────────────────────────────
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    due = get_due_reminders()
+    for r in due:
+        try:
+            await context.bot.send_message(chat_id=YOUR_USER_ID, text=f"Reminder: {r['note']}")
+            _delete_reminder(r['id'])
+        except Exception as e:
+            logging.error(f"Reminder delivery error: {e}")
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -766,6 +816,7 @@ def main():
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+    app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     print("Dot is running — Granola, Dropbox, Gmail, Calendar (work)...")
     app.run_polling()
 
