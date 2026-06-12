@@ -18,6 +18,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 YOUR_USER_ID      = int(os.getenv("YOUR_TELEGRAM_USER_ID"))
 GRANOLA_TOKEN     = os.getenv("GRANOLA_TOKEN")
 DROPBOX_TOKEN     = os.getenv("DROPBOX_TOKEN")
+BRIEFING_TIME_STR = os.getenv("BRIEFING_TIME", "08:00")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -797,6 +798,42 @@ async def error_handler(update, context):
         except Exception:
             pass
 
+# ── MORNING BRIEFING (runs daily at BRIEFING_TIME) ────────────────────────────
+async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
+    from datetime import date
+    from memory import list_reminders as _lr
+
+    today_label = date.today().strftime("%A, %B %-d")
+    today_str   = date.today().strftime("%Y-%m-%d")
+    sections    = [f"Good morning — {today_label}\n"]
+
+    # Today's calendar
+    cal = await asyncio.to_thread(list_calendar_events, 1, 10)
+    sections.append("Today's calendar")
+    sections.append(cal if "No events" not in cal else "Nothing on the calendar today.")
+
+    # Unread email (last 24h)
+    sections.append("")
+    email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
+    sections.append("Unread emails")
+    sections.append(email if "No emails" not in email else "Inbox clear.")
+
+    # Reminders due today
+    due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
+    if due_today:
+        sections.append("")
+        sections.append("Reminders due today")
+        for r in due_today:
+            sections.append(f"• {r['note']} (at {r['due_at'][11:]})")
+
+    try:
+        await context.bot.send_message(
+            chat_id=YOUR_USER_ID,
+            text="\n".join(sections)[:4000]
+        )
+    except Exception as e:
+        logging.error(f"Morning briefing error: {e}")
+
 # ── REMINDER CHECKER (runs every 60s via JobQueue) ────────────────────────────
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     due = get_due_reminders()
@@ -817,6 +854,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    _h, _m = map(int, BRIEFING_TIME_STR.split(":"))
+    app.job_queue.run_daily(
+        send_morning_briefing,
+        time=_dt.time(_h, _m, tzinfo=ZoneInfo("America/Toronto"))
+    )
     print("Dot is running — Granola, Dropbox, Gmail, Calendar (work)...")
     app.run_polling()
 
