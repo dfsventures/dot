@@ -171,6 +171,21 @@ def search_gmail_work(query: str, max_results: int = 10):
 def read_gmail_work(message_id: str):
     return _read_gmail_svc(gmail_work, message_id)
 
+def create_gmail_draft(to: str, subject: str, body: str, thread_id: str = None) -> str:
+    from email.mime.text import MIMEText
+    msg = MIMEText(body)
+    msg['to'] = to
+    msg['subject'] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    draft_body = {'message': {'raw': raw}}
+    if thread_id:
+        draft_body['message']['threadId'] = thread_id
+    try:
+        result = gmail_work.users().drafts().create(userId='me', body=draft_body).execute()
+        return f"Draft created (ID: {result['id']}). Open Gmail to review and send."
+    except Exception as e:
+        return f"Draft creation error: {e}"
+
 def list_calendar_events(days_ahead: int = 7, max_results: int = 10):
     """List upcoming calendar events from work Google Calendar."""
     from datetime import datetime, timezone, timedelta
@@ -453,6 +468,16 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]}
     },
     {
+        "name": "create_gmail_draft",
+        "description": "Create a Gmail draft for Joey to review and send himself — never sends automatically. Use when asked to draft or reply to an email. Read the thread first with search_gmail_work + read_gmail_work so the draft has full context. For replies, pass the thread_id so the draft appears in the right thread.",
+        "input_schema": {"type": "object", "properties": {
+            "to":        {"type": "string", "description": "Recipient email address"},
+            "subject":   {"type": "string", "description": "Subject line — use 'Re: original subject' for replies"},
+            "body":      {"type": "string", "description": "Full email body text"},
+            "thread_id": {"type": "string", "description": "Gmail thread ID to reply in-thread (get from search_gmail_work results)"}
+        }, "required": ["to", "subject", "body"]}
+    },
+    {
         "name": "list_calendar_events",
         "description": "List upcoming events from Joey's work Google Calendar. Use for 'what's on my calendar', 'what do I have today/this week', 'who am I meeting'. Defaults to next 7 days.",
         "input_schema": {"type": "object", "properties": {
@@ -547,6 +572,7 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "search_gmail_work":    search_gmail_work,
     "read_gmail_work":      read_gmail_work,
+    "create_gmail_draft":   create_gmail_draft,
     "list_calendar_events": list_calendar_events,
     "get_calendar_event":   get_calendar_event,
     "create_calendar_event": create_calendar_event,
@@ -569,6 +595,7 @@ infrastructure, and technology. He is a partner at DFS Lab (dfs.vc).
 
 Your tools and what they contain:
 - search_gmail_work / read_gmail_work: Joey's work Workspace email (founders, investors, DFS Lab)
+- create_gmail_draft: create a Gmail draft for Joey to review — NEVER sends automatically
 - list_calendar_events / get_calendar_event / create_calendar_event / update_calendar_event / delete_calendar_event: Joey's work Google Calendar (read and write)
 - search_granola / read_granola: Call and meeting notes from Granola
 - search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
@@ -577,7 +604,7 @@ Your tools and what they contain:
 
 When a question involves a person or company, search Granola first (most recent call context),
 then work email. For documents, search Dropbox. For scheduling questions, check calendar.
-Search proactively — don't ask permission. For calendar writes (create/update/delete), always confirm the key details in your response before executing — state what you're about to create or change and give Joey a chance to correct it before calling the tool.
+Search proactively — don't ask permission. For calendar writes (create/update/delete) and email drafts, always confirm the key details in your response before executing — state what you're about to create or change and give Joey a chance to correct it before calling the tool. Email drafts are never sent automatically; Joey reviews and sends from Gmail.
 Facts retrieved from your long-term memory store appear inside <relevant_memories> tags
 at the top of user messages — treat them as background context about Joey and his work.
 Be direct and specific. No filler, no hedging."""
