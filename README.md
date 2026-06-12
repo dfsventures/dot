@@ -34,11 +34,15 @@ Three modules:
 
 | Tool | Capability |
 |---|---|
-| `search_gmail_work` / `read_gmail_work` | Search and read work Gmail (read-only scope) |
+| `search_gmail_work` / `read_gmail_work` | Search and read work Gmail |
+| `create_gmail_draft` | Draft a reply or new email — never auto-sends; Joey reviews and sends from Gmail |
 | `list/get/create/update/delete_calendar_event` | Full read-write Google Calendar management, including attendee invites and auto-generated Meet links |
 | `search_granola` / `read_granola` | Search meeting notes and read summaries + transcripts from Granola |
 | `search_dropbox` / `read_dropbox_file` | Find and read Dropbox files (PDF, DOCX, TXT, MD) |
 | `web_search` | Anthropic's native server-side web search |
+| `set_reminder` / `list_reminders` / `delete_reminder` | Time-based reminders delivered as Telegram messages |
+| `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
+| Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
 
 Plus Telegram commands:
 
@@ -96,6 +100,24 @@ Supported types: PDF, DOCX, PPTX, XLSX/XLS, CSV, TXT, MD.
 
 On `/newsession`, the outgoing conversation is run through Claude with an extraction prompt and any durable facts (people, companies, deals, preferences) are saved before the history is cleared.
 
+### Voice messages
+
+A `voice` message handler runs alongside the text handler. When a voice note arrives, the `.ogg` file is downloaded from Telegram, transcribed locally with [Whisper](https://github.com/openai/whisper) (`tiny` model, ~75 MB, CPU-only, no API cost), and the transcript is echoed back in italics before being passed to the existing agent loop unchanged — no other code path changes. Whisper is lazy-loaded on the first voice message so it doesn't add ~1 GB of PyTorch to startup memory.
+
+**Prerequisite:** `sudo apt install ffmpeg` — Whisper needs it to decode audio. The first voice message also downloads the Whisper model weights (~75 MB) to `~/.cache/whisper`; subsequent loads are instant.
+
+### Reminders
+
+Reminders are stored in a `reminders` table in `dot.db` with a note and a `due_at` timestamp in Toronto local time. A `JobQueue` job runs every 60 seconds, checks for any reminders whose `due_at` has passed, sends them as Telegram messages, and deletes them. Three tools — `set_reminder`, `list_reminders`, `delete_reminder` — let Claude set and manage them from natural language: "remind me to follow up with X in two weeks" resolves to a specific `YYYY-MM-DD HH:MM` timestamp and a confirmation.
+
+### Morning briefing
+
+Every morning at a configurable time (default `08:00` Toronto; set `BRIEFING_TIME=HH:MM` in `.dot.env`), Dot sends an unprompted Telegram message with today's calendar events, unread emails from the last 24 hours, and any reminders due that day. It calls the existing tool functions directly — no extra API call — and runs via PTB's `job_queue.run_daily`, so no extra cron entry is needed.
+
+### Deal tracking
+
+A `deals` table in `dot.db` holds a lightweight CRM: company name (unique), pipeline stage, last touchpoint, next action, and notes. Stages follow a fixed vocabulary: `sourcing`, `first_call`, `due_diligence`, `passed`, `invested`. Three tools — `update_deal`, `get_deal_info`, `list_deals` — make the pipeline queryable in natural language: "add Acme to the pipeline", "move Acme to due diligence, next action is send term sheet by June 20", "what's in due diligence right now?". `update_deal` is an upsert — it creates the deal if it doesn't exist and only updates the fields you specify if it does.
+
 ## Security model
 
 - **Single-user lockdown**: every handler checks the sender's Telegram user ID against `YOUR_TELEGRAM_USER_ID` and silently ignores anyone else.
@@ -152,9 +174,11 @@ python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 ```
 
-Optional: install Ghostscript (`apt install ghostscript`) for oversized-PDF compression during ingestion.
+Optional system packages:
+- `sudo apt install ghostscript` — oversized-PDF compression during ingestion
+- `sudo apt install ffmpeg` — required for voice message transcription (Whisper needs it to decode audio)
 
-Note: the first launch downloads the ~80 MB embedding model from the Hugging Face Hub (see [Embedding model](#embedding-model)) — it needs internet access and takes a minute, then loads from local cache thereafter.
+Note: the first launch downloads the ~80 MB embedding model from the Hugging Face Hub (see [Embedding model](#embedding-model)) — it needs internet access and takes a minute. The first voice message similarly downloads the ~75 MB Whisper model on demand.
 
 ### 2. Configure secrets
 
@@ -166,6 +190,7 @@ cp .env.example .dot.env
 - **Telegram**: create a bot with [@BotFather](https://t.me/BotFather) → `TELEGRAM_TOKEN`. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot) → `YOUR_TELEGRAM_USER_ID`.
 - **Anthropic**: API key from [console.anthropic.com](https://console.anthropic.com).
 - **Granola**: API token (the public API requires an Enterprise plan).
+- **Briefing time**: `BRIEFING_TIME=08:00` sets when the morning briefing fires (Toronto local time). Omit to use the default.
 
 ### 3. Google OAuth
 
@@ -177,6 +202,8 @@ venv/bin/python auth_work.py
 ```
 
 This saves `token_work.pickle`; the agent refreshes it automatically thereafter.
+
+> **If upgrading from an earlier version:** `auth_work.py` now includes `gmail.compose` scope for draft creation. Delete the existing `token_work.pickle` and re-run `auth_work.py` to pick up the new scope — the old token will cause a 403 when trying to create drafts.
 
 ### 4. Dropbox OAuth
 
