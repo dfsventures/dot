@@ -932,32 +932,70 @@ async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
 
     today_label = date.today().strftime("%A, %B %-d")
     today_str   = date.today().strftime("%Y-%m-%d")
-    sections    = [f"Good morning — {today_label}\n"]
 
-    # Today's calendar
-    cal = await asyncio.to_thread(list_calendar_events, 1, 10)
-    sections.append("Today's calendar")
-    sections.append(cal if "No events" not in cal else "Nothing on the calendar today.")
-
-    # Unread email (last 24h)
-    sections.append("")
+    cal   = await asyncio.to_thread(list_calendar_events, 1, 10)
     email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
-    sections.append("Unread emails")
-    sections.append(email if "No emails" not in email else "Inbox clear.")
-
-    # Reminders due today
     due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
-    if due_today:
-        sections.append("")
-        sections.append("Reminders due today")
-        for r in due_today:
-            sections.append(f"• {r['note']} (at {r['due_at'][11:]})")
+    reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
+
+    prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
+
+RAW DATA:
+
+CALENDAR (today):
+{cal}
+
+UNREAD EMAIL (last 24h):
+{email}
+
+REMINDERS DUE TODAY:
+{reminders_str}
+
+Instructions:
+- Calendar: show time in 12-hour format, event name, and attendee first names only. Skip all-day/personal blocks unless notable. No IDs.
+- Email: show sender name, subject, and received time. No IDs. Flag anything that looks like it needs a reply.
+- Use web_search to find 3–5 of today's top news headlines relevant to African tech, fintech, AI, and startup investing. One sentence of context per headline.
+- Sections: Today, Email, News. No greeting, no filler."""
+
+    briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
+    msgs = [{"role": "user", "content": prompt}]
 
     try:
-        await context.bot.send_message(
-            chat_id=YOUR_USER_ID,
-            text="\n".join(sections)[:4000]
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            tools=briefing_tools,
+            messages=msgs,
         )
+        iterations = 0
+        while response.stop_reason in ("tool_use", "pause_turn") and iterations < 5:
+            iterations += 1
+            msgs.append({
+                "role": "assistant",
+                "content": [b.model_dump(exclude_none=True) for b in response.content],
+            })
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result, is_error = await asyncio.to_thread(run_tool, block.name, dict(block.input))
+                        tr = {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                        if is_error:
+                            tr["is_error"] = True
+                        tool_results.append(tr)
+                msgs.append({"role": "user", "content": tool_results})
+            response = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-sonnet-4-6",
+                max_tokens=1500,
+                tools=briefing_tools,
+                messages=msgs,
+            )
+        text = " ".join(b.text for b in response.content if b.type == "text").strip()
+        if text:
+            for i in range(0, len(text), 4000):
+                await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[i:i+4000])
     except Exception as e:
         logging.error(f"Morning briefing error: {e}")
 
