@@ -787,24 +787,29 @@ def run_tool(name: str, tool_input: dict):
         logging.exception(f"Tool {name} failed")
         return f"Tool error: {e}", True
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global conversation_history
-    if update.effective_user.id != YOUR_USER_ID:
-        return
+_whisper_model = None
 
-    user_text = update.message.text
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        logging.info("Loading Whisper tiny model...")
+        _whisper_model = whisper.load_model("tiny")
+        logging.info("Whisper model loaded.")
+    return _whisper_model
+
+async def _process_message(update: Update, user_text: str):
+    global conversation_history
     # A previous turn that crashed mid-tool-call leaves dangling blocks in the
     # in-memory history without ever hitting disk — repair before building on it.
     conversation_history = repair_history(conversation_history)
     user_content = await asyncio.to_thread(build_user_content, user_text)
     conversation_history.append({"role": "user", "content": user_content})
 
-    # Context window management — compress if over token budget
     if estimate_tokens(conversation_history) > CONTEXT_TOKEN_LIMIT:
         conversation_history = await asyncio.to_thread(compress_history, conversation_history)
 
     await update.message.chat.send_action("typing")
-
     response = await asyncio.to_thread(call_claude)
 
     iterations = 0
@@ -825,8 +830,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tr["is_error"] = True
                 tool_results.append(tr)
             conversation_history.append({"role": "user", "content": tool_results})
-        # pause_turn (server-side tool hit its iteration limit): just re-send —
-        # the API sees the trailing server_tool_use block and resumes.
+        # pause_turn: re-send so the API can resume from the trailing server_tool_use block.
         await update.message.chat.send_action("typing")
         response = await asyncio.to_thread(call_claude)
 
@@ -836,6 +840,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i in range(0, len(final), 4000):
         await update.message.reply_text(final[i:i+4000])
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != YOUR_USER_ID:
+        return
+    await _process_message(update, update.message.text)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != YOUR_USER_ID:
+        return
+
+    import tempfile
+    voice_file = await context.bot.get_file(update.message.voice.file_id)
+    with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
+        await voice_file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        await update.message.chat.send_action("typing")
+        model = await asyncio.to_thread(_get_whisper)
+        result = await asyncio.to_thread(model.transcribe, tmp_path)
+        text = result["text"].strip()
+    except Exception as e:
+        logging.exception("Whisper transcription failed")
+        await update.message.reply_text(f"Transcription error: {e}")
+        return
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    if not text:
+        await update.message.reply_text("Couldn't transcribe that — try again.")
+        return
+
+    await update.message.reply_text(f"_{text}_", parse_mode="Markdown")
+    await _process_message(update, text)
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_remember(update, context):
@@ -938,6 +979,7 @@ def main():
     app.add_handler(CommandHandler("forget",     cmd_forget))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(error_handler)
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     from zoneinfo import ZoneInfo
