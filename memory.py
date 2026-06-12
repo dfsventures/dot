@@ -37,6 +37,16 @@ conn.executescript("""
         due_at TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS deals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company TEXT NOT NULL UNIQUE,
+        stage TEXT NOT NULL DEFAULT 'sourcing',
+        last_touchpoint TEXT DEFAULT '',
+        next_action TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+    );
 """)
 conn.commit()
 
@@ -141,6 +151,65 @@ def list_reminders() -> list:
         "SELECT id, note, due_at FROM reminders ORDER BY due_at ASC"
     ).fetchall()
     return [{"id": r[0], "note": r[1], "due_at": r[2]} for r in rows]
+
+# ── DEAL TRACKING ─────────────────────────────────────────────────────────────
+def get_deal(company: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id, company, stage, last_touchpoint, next_action, notes, created_at, updated_at "
+        "FROM deals WHERE company = ? COLLATE NOCASE",
+        (company,)
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        'id': row[0], 'company': row[1], 'stage': row[2],
+        'last_touchpoint': row[3], 'next_action': row[4], 'notes': row[5],
+        'created_at': row[6], 'updated_at': row[7],
+    }
+
+def upsert_deal(company: str, stage: str = None, last_touchpoint: str = None,
+                next_action: str = None, notes: str = None) -> dict:
+    existing = get_deal(company)
+    if existing:
+        fields, values = [], []
+        for col, val in [('stage', stage), ('last_touchpoint', last_touchpoint),
+                         ('next_action', next_action), ('notes', notes)]:
+            if val is not None:
+                fields.append(f"{col} = ?")
+                values.append(val)
+        if fields:
+            fields.append("updated_at = datetime('now')")
+            conn.execute(
+                f"UPDATE deals SET {', '.join(fields)} WHERE company = ? COLLATE NOCASE",
+                values + [company]
+            )
+            conn.commit()
+    else:
+        conn.execute(
+            "INSERT INTO deals (company, stage, last_touchpoint, next_action, notes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (company, stage or 'sourcing', last_touchpoint or '', next_action or '', notes or '')
+        )
+        conn.commit()
+    return get_deal(company)
+
+def list_deals(stage: str = None) -> list:
+    if stage:
+        rows = conn.execute(
+            "SELECT id, company, stage, last_touchpoint, next_action, notes, created_at, updated_at "
+            "FROM deals WHERE stage = ? COLLATE NOCASE ORDER BY updated_at DESC",
+            (stage,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, company, stage, last_touchpoint, next_action, notes, created_at, updated_at "
+            "FROM deals ORDER BY updated_at DESC"
+        ).fetchall()
+    return [
+        {'id': r[0], 'company': r[1], 'stage': r[2], 'last_touchpoint': r[3],
+         'next_action': r[4], 'notes': r[5], 'created_at': r[6], 'updated_at': r[7]}
+        for r in rows
+    ]
 
 # ── JSON PARSING ──────────────────────────────────────────────────────────────
 def parse_json_array(raw: str) -> list:

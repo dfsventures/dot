@@ -49,6 +49,7 @@ from memory import (
     retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array,
     set_reminder as _set_reminder, get_due_reminders, delete_reminder as _delete_reminder,
     list_reminders as _list_reminders,
+    upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -413,6 +414,35 @@ def search_dropbox(query: str, max_results: int = 10):
     except Exception as e:
         return f"Dropbox search error: {e}"
 
+def update_deal(company: str, stage: str = None, last_touchpoint: str = None,
+               next_action: str = None, notes: str = None) -> str:
+    deal = _upsert_deal(company, stage, last_touchpoint, next_action, notes)
+    return (f"Deal: {deal['company']} | Stage: {deal['stage']} | "
+            f"Next action: {deal['next_action'] or '—'} | "
+            f"Last touchpoint: {deal['last_touchpoint'] or '—'}")
+
+def get_deal_info(company: str) -> str:
+    deal = _get_deal(company)
+    if not deal:
+        return f"No deal found for '{company}'."
+    return "\n".join([
+        f"Company: {deal['company']}",
+        f"Stage: {deal['stage']}",
+        f"Last touchpoint: {deal['last_touchpoint'] or '—'}",
+        f"Next action: {deal['next_action'] or '—'}",
+        f"Notes: {deal['notes'] or '—'}",
+        f"Created: {deal['created_at'][:10]} | Updated: {deal['updated_at'][:10]}",
+    ])
+
+def list_deals(stage: str = None) -> str:
+    deals = _list_deals(stage)
+    if not deals:
+        return f"No deals{' in stage: ' + stage if stage else ' in pipeline'}."
+    return "\n".join(
+        f"{d['company']} | {d['stage']} | Next: {d['next_action'] or '—'} | Updated: {d['updated_at'][:10]}"
+        for d in deals
+    )
+
 def set_reminder(note: str, due_at: str) -> str:
     r = _set_reminder(note, due_at)
     return f"Reminder set: '{r['note']}' at {r['due_at']} (ID {r['id']})"
@@ -566,6 +596,31 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {
             "reminder_id": {"type": "integer"}
         }, "required": ["reminder_id"]}
+    },
+    {
+        "name": "update_deal",
+        "description": "Create or update a deal in the pipeline. Use for 'add company X', 'move X to due diligence', 'log that I spoke with X', 'set next action for X'. Stages: sourcing, first_call, due_diligence, passed, invested.",
+        "input_schema": {"type": "object", "properties": {
+            "company":         {"type": "string", "description": "Company name"},
+            "stage":           {"type": "string", "description": "sourcing | first_call | due_diligence | passed | invested"},
+            "last_touchpoint": {"type": "string", "description": "Brief note on the last interaction, e.g. 'Call 2026-06-11, discussed Series A terms'"},
+            "next_action":     {"type": "string", "description": "What needs to happen next, e.g. 'Send term sheet by Jun 20'"},
+            "notes":           {"type": "string", "description": "Any other context about this deal"}
+        }, "required": ["company"]}
+    },
+    {
+        "name": "get_deal_info",
+        "description": "Get full deal details for a specific company — stage, last touchpoint, next action, notes.",
+        "input_schema": {"type": "object", "properties": {
+            "company": {"type": "string"}
+        }, "required": ["company"]}
+    },
+    {
+        "name": "list_deals",
+        "description": "List all deals in the pipeline, optionally filtered by stage. Use for 'what's in due diligence?', 'show me the pipeline', 'what deals are we tracking?'.",
+        "input_schema": {"type": "object", "properties": {
+            "stage": {"type": "string", "description": "Optional filter: sourcing | first_call | due_diligence | passed | invested"}
+        }}
     }
 ]
 
@@ -585,6 +640,9 @@ TOOL_FUNCTIONS = {
     "set_reminder":         set_reminder,
     "list_reminders":       list_reminders,
     "delete_reminder":      delete_reminder,
+    "update_deal":          update_deal,
+    "get_deal_info":        get_deal_info,
+    "list_deals":           list_deals,
 }
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -601,6 +659,7 @@ Your tools and what they contain:
 - search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
 - web_search: Real-time web search
 - set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
+- update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 
 When a question involves a person or company, search Granola first (most recent call context),
 then work email. For documents, search Dropbox. For scheduling questions, check calendar.
