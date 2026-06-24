@@ -403,18 +403,20 @@ def read_granola(note_id: str):
 def search_dropbox(query: str, max_results: int = 10):
     import dropbox.files as dbx_files
     try:
-        options = dbx_files.SearchOptions(
-            max_results=max_results,
-            filename_only=True,
-        )
+        options = dbx_files.SearchOptions(max_results=max_results, filename_only=True)
         results = dbx.files_search_v2(query, options=options)
-        matches = results.matches
-        if not matches:
-            return "No Dropbox files found."
         lines = []
-        for m in matches:
+        for m in results.matches:
             try:
-                meta = m.metadata.get_metadata()
+                wrapper = m.metadata
+                # MetadataV2 is a union type — unwrap only if the tag is "metadata"
+                if hasattr(wrapper, 'is_metadata') and wrapper.is_metadata():
+                    meta = wrapper.get_metadata()
+                else:
+                    meta = wrapper
+                # Guard against SDK versions that return a bound method instead of the value
+                if callable(meta) or not hasattr(meta, 'name'):
+                    continue
                 size_kb = getattr(meta, 'size', 0) // 1024
                 lines.append(f"Name: {meta.name} | Path: {meta.path_display} | Size: {size_kb}KB")
             except Exception:
