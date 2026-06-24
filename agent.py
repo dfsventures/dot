@@ -400,17 +400,25 @@ def read_granola(note_id: str):
         return f"Granola read error: {e}"
 
 def search_dropbox(query: str, max_results: int = 10):
+    import dropbox.files as dbx_files
     try:
-        results = dbx.files_search_v2(query)
-        matches = results.matches[:max_results]
+        options = dbx_files.SearchOptions(
+            max_results=max_results,
+            filename_only=True,
+        )
+        results = dbx.files_search_v2(query, options=options)
+        matches = results.matches
         if not matches:
             return "No Dropbox files found."
         lines = []
         for m in matches:
-            meta = m.metadata.metadata
-            size_kb = getattr(meta, 'size', 0) // 1024
-            lines.append(f"Name: {meta.name} | Path: {meta.path_display} | Size: {size_kb}KB")
-        return "\n".join(lines)
+            try:
+                meta = m.metadata.get_metadata()
+                size_kb = getattr(meta, 'size', 0) // 1024
+                lines.append(f"Name: {meta.name} | Path: {meta.path_display} | Size: {size_kb}KB")
+            except Exception:
+                continue
+        return "\n".join(lines) if lines else "No Dropbox files found."
     except Exception as e:
         return f"Dropbox search error: {e}"
 
