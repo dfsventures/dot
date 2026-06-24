@@ -1099,20 +1099,15 @@ Attendees: {', '.join(names)} ({', '.join(emails)})
 Steps:
 1. Search Granola for previous call notes with these contacts.
 2. Search Gmail for recent email threads with them.
-3. Search the web for recent news about them and their company.
 
 Write a tight prep brief:
-- Who they are and what their company does (2-3 sentences)
-- Key context from previous interactions
-- 2-3 relevant recent news items
+- Who they are and what their company does (2-3 sentences, from what you find)
+- Key context from previous interactions (calls, emails)
 - 1-2 suggested talking points or things to follow up on
 
 Specific and direct. Bullet points. No filler."""
 
-        prep_tools = [
-            t for t in TOOLS
-            if t.get('name') in _PREP_TOOL_NAMES or t.get('type') == 'web_search_20260209'
-        ]
+        prep_tools = [t for t in TOOLS if t.get('name') in _PREP_TOOL_NAMES]
         msgs = [{"role": "user", "content": prompt}]
 
         try:
