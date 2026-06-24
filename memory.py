@@ -193,6 +193,22 @@ def upsert_deal(company: str, stage: str = None, last_touchpoint: str = None,
         conn.commit()
     return get_deal(company)
 
+def get_stale_deals(days: int = 14) -> list:
+    """Deals in active stages with no update in the last `days` days."""
+    rows = conn.execute(
+        "SELECT id, company, stage, last_touchpoint, next_action, updated_at "
+        "FROM deals "
+        "WHERE updated_at <= datetime('now', ?) "
+        "AND stage NOT IN ('passed', 'invested') "
+        "ORDER BY updated_at ASC",
+        (f'-{days} days',)
+    ).fetchall()
+    return [
+        {'id': r[0], 'company': r[1], 'stage': r[2],
+         'last_touchpoint': r[3], 'next_action': r[4], 'updated_at': r[5]}
+        for r in rows
+    ]
+
 def list_deals(stage: str = None) -> list:
     if stage:
         rows = conn.execute(

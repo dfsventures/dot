@@ -50,6 +50,7 @@ from memory import (
     set_reminder as _set_reminder, get_due_reminders, delete_reminder as _delete_reminder,
     list_reminders as _list_reminders,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
+    get_stale_deals,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -945,6 +946,11 @@ async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
     email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
     due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
     reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
+    stale = await asyncio.to_thread(get_stale_deals)
+    stale_str = "\n".join(
+        f"- {d['company']} ({d['stage']}) — last updated {d['updated_at'][:10]}, next action: {d['next_action'] or '—'}"
+        for d in stale
+    ) or "None"
 
     prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
 
@@ -959,11 +965,15 @@ UNREAD EMAIL (last 24h):
 REMINDERS DUE TODAY:
 {reminders_str}
 
+DEALS NEEDING ATTENTION (no update in 14+ days, active stages only):
+{stale_str}
+
 Instructions:
 - Calendar: show time in 12-hour format, event name, and attendee first names only. Skip all-day/personal blocks unless notable. No IDs.
 - Email: show sender name, subject, and received time. No IDs. Flag anything that looks like it needs a reply.
+- Deals: if any stale deals exist, include a "Needs attention" section listing them with how long since last update and the pending next action. Skip the section entirely if none.
 - Use web_search to find 3–5 of today's top news headlines relevant to African tech, fintech, AI, and startup investing. One sentence of context per headline.
-- Sections: Today, Email, News. No greeting, no filler."""
+- Sections: Today, Email, Needs attention (if any), News. No greeting, no filler."""
 
     briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
     msgs = [{"role": "user", "content": prompt}]
