@@ -797,6 +797,9 @@ def run_tool(name: str, tool_input: dict):
         return f"Tool error: {e}", True
 
 _whisper_model = None
+_prepped_events: set = set()
+_INTERNAL_DOMAINS = {'dfslab.net', 'dfs.vc'}
+_PREP_TOOL_NAMES  = {'search_gmail_work', 'read_gmail_work', 'search_granola', 'read_granola'}
 
 def _get_whisper():
     global _whisper_model
@@ -925,6 +928,31 @@ async def cmd_newsession(update, context):
     save_session()
     await update.message.reply_text("Session cleared. Memories extracted.")
 
+async def cmd_log(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage: /log <note or pasted conversation>")
+        return
+    await update.message.chat.send_action("typing")
+    try:
+        resp = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system='Extract facts worth remembering from this note or conversation. Return ONLY a JSON array of strings. Each fact must be self-contained. Focus on people, companies, deals, decisions, commitments. If nothing worth keeping, return [].',
+            messages=[{"role": "user", "content": text}]
+        )
+        facts = parse_json_array(resp.content[0].text)
+        saved = 0
+        for fact in facts:
+            if fact and len(fact) > 10:
+                save_memory(fact, "log")
+                saved += 1
+        await update.message.reply_text(f"Logged. {saved} fact(s) saved to memory.")
+    except Exception as e:
+        await update.message.reply_text(f"Log error: {e}")
+
 # ── ERROR HANDLER ─────────────────────────────────────────────────────────────
 async def error_handler(update, context):
     logging.error(f"Exception: {context.error}")
@@ -1017,6 +1045,113 @@ Instructions:
     except Exception as e:
         logging.error(f"Morning briefing error: {e}")
 
+# ── MEETING PREP BRIEF (runs every 5 min, fires ~30 min before external meetings) ─
+async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timezone, timedelta
+
+    now          = datetime.now(timezone.utc)
+    window_start = now + timedelta(minutes=25)
+    window_end   = now + timedelta(minutes=35)
+
+    try:
+        cal_result = await asyncio.to_thread(
+            lambda: calendar_work.events().list(
+                calendarId='primary',
+                timeMin=window_start.isoformat(),
+                timeMax=window_end.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+        )
+        events = cal_result.get('items', [])
+    except Exception as e:
+        logging.error(f"Meeting prep calendar error: {e}")
+        return
+
+    for event in events:
+        event_id = event.get('id', '')
+        if event_id in _prepped_events:
+            continue
+
+        attendees = event.get('attendees', [])
+        external = [
+            a for a in attendees
+            if not a.get('self', False)
+            and not any(a.get('email', '').lower().endswith(f'@{d}') for d in _INTERNAL_DOMAINS)
+        ]
+
+        _prepped_events.add(event_id)
+
+        if not external:
+            continue
+
+        title  = event.get('summary', 'Untitled')
+        names  = [a.get('displayName') or a.get('email', '') for a in external]
+        emails = [a.get('email', '') for a in external]
+
+        prompt = f"""Prepare a meeting brief for Joey (Africa-focused tech investor, DFS Lab).
+
+Meeting: {title} — starting in ~30 minutes
+Attendees: {', '.join(names)} ({', '.join(emails)})
+
+Steps:
+1. Search Granola for previous call notes with these contacts.
+2. Search Gmail for recent email threads with them.
+3. Search the web for recent news about them and their company.
+
+Write a tight prep brief:
+- Who they are and what their company does (2-3 sentences)
+- Key context from previous interactions
+- 2-3 relevant recent news items
+- 1-2 suggested talking points or things to follow up on
+
+Specific and direct. Bullet points. No filler."""
+
+        prep_tools = [
+            t for t in TOOLS
+            if t.get('name') in _PREP_TOOL_NAMES or t.get('type') == 'web_search_20260209'
+        ]
+        msgs = [{"role": "user", "content": prompt}]
+
+        try:
+            response = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-sonnet-4-6",
+                max_tokens=1000,
+                tools=prep_tools,
+                messages=msgs,
+            )
+            iterations = 0
+            while response.stop_reason in ("tool_use", "pause_turn") and iterations < 8:
+                iterations += 1
+                msgs.append({
+                    "role": "assistant",
+                    "content": [b.model_dump(exclude_none=True) for b in response.content],
+                })
+                if response.stop_reason == "tool_use":
+                    tool_results = []
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            res, is_error = await asyncio.to_thread(run_tool, block.name, dict(block.input))
+                            tr = {"type": "tool_result", "tool_use_id": block.id, "content": res}
+                            if is_error:
+                                tr["is_error"] = True
+                            tool_results.append(tr)
+                    msgs.append({"role": "user", "content": tool_results})
+                response = await asyncio.to_thread(
+                    client.messages.create,
+                    model="claude-sonnet-4-6",
+                    max_tokens=1000,
+                    tools=prep_tools,
+                    messages=msgs,
+                )
+            text = " ".join(b.text for b in response.content if b.type == "text").strip()
+            if text:
+                header = f"Prep — {title} (in ~30 min)\n\n"
+                await context.bot.send_message(chat_id=YOUR_USER_ID, text=(header + text)[:4000])
+        except Exception as e:
+            logging.error(f"Meeting prep error for '{title}': {e}")
+
 # ── REMINDER CHECKER (runs every 60s via JobQueue) ────────────────────────────
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     due = get_due_reminders()
@@ -1034,10 +1169,12 @@ def main():
     app.add_handler(CommandHandler("memories",   cmd_memories))
     app.add_handler(CommandHandler("forget",     cmd_forget))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
+    app.add_handler(CommandHandler("log",        cmd_log))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(error_handler)
-    app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+    app.job_queue.run_repeating(check_reminders,    interval=60,  first=10)
+    app.job_queue.run_repeating(check_meeting_prep, interval=300, first=60)
     from zoneinfo import ZoneInfo
     import datetime as _dt
     _h, _m = map(int, BRIEFING_TIME_STR.split(":"))

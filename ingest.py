@@ -40,7 +40,15 @@ PROCESSED_FOLDER = "/Dot Dump/Processed"
 FAILED_FOLDER    = "/Dot Dump/Failed"
 
 # ── MEMORY (shared with agent.py) ─────────────────────────────────────────────
-from memory import conn, save_memory, parse_json_array
+from memory import conn, save_memory, parse_json_array, list_deals
+
+def _find_deal_match(fact: str, deal_names: list) -> str | None:
+    """Return the first active deal company name found in the fact, or None."""
+    fact_lower = fact.lower()
+    for name in deal_names:
+        if name.lower() in fact_lower:
+            return name
+    return None
 
 def already_ingested(path: str) -> bool:
     row = conn.execute(
@@ -403,6 +411,10 @@ SUPPORTED = {'.pdf', '.docx', '.pptx', '.xlsx', '.xls', '.csv', '.txt', '.md'}
 # ── MAIN INGESTION LOOP ───────────────────────────────────────────────────────
 def run():
     print(f"Checking {INBOX_FOLDER}...")
+    active_deal_names = [
+        d['company'] for d in list_deals()
+        if d['stage'] not in ('passed', 'invested')
+    ]
     files = list_inbox()
 
     if not files:
@@ -463,7 +475,9 @@ def run():
                 fact_count = len(facts)
                 tag = f"source:{entry.name}"
                 for fact in facts:
-                    save_memory(fact, tags=tag)
+                    deal_match = _find_deal_match(fact, active_deal_names)
+                    fact_tag = f"{tag},deal:{deal_match}" if deal_match else tag
+                    save_memory(fact, tags=fact_tag)
 
             print(f"  Total memories saved: {fact_count}")
 
