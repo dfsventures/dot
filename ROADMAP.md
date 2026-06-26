@@ -41,3 +41,11 @@ JobQueue job runs every 5 minutes. When a calendar event with external attendees
 ### Deal + memory auto-linking in ingest ✓ — 2026-06-24
 
 When `ingest.py` extracts facts from a document, it checks each fact against active deal company names and tags matching memories with `deal:<company>`. Makes `get_deal_info` progressively richer as documents are ingested.
+
+### Named conversation sessions ✓ — 2026-06-26
+
+`/switch <name>` saves the current conversation and loads (or creates) a named session stored in `sessions/<name>.json`. `/sessions` lists all conversations with message counts. Existing `session.json` auto-migrates to `sessions/default.json` on first startup. Typing `/` in Telegram now shows all commands and descriptions (registered via `set_my_commands` on startup).
+
+### Web conversation viewer ✓ — 2026-06-26
+
+`web.py` is a FastAPI app (port 8080) that shows all conversation sessions in a read-only chat UI. Password-protected via `WEB_SECRET` in `.dot.env`. Auto-refreshes every 5 seconds. Designed for access over Tailscale — private, no open ports, no firewall rules. Run as a separate `web.service` systemd unit.

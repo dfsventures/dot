@@ -22,13 +22,17 @@ Built for an investor workflow (pitch decks, founder calls, deal tracking), but 
   drop a file in,      │  extract → Claude distills  │
   facts come out       │  facts → memory store       │
                        └─────────────────────────────┘
+
+  Browser (Tailscale) ◄──────────────────────────────►  web.py
+                             read-only session viewer       (port 8080)
 ```
 
-Three modules:
+Four modules:
 
 - **`agent.py`** — the Telegram bot and agent loop. Receives a message, retrieves relevant memories, calls Claude with a tool belt, executes tool calls in a loop until Claude produces a final answer, and replies.
 - **`ingest.py`** — a cron-driven pipeline that watches a Dropbox folder. Any document dropped there gets downloaded, parsed, distilled into facts by Claude, and saved to memory. Processed files are moved to `Processed/`, failures to `Failed/`.
 - **`memory.py`** — the shared memory layer: SQLite for durable storage, ChromaDB + sentence-transformers (`all-MiniLM-L6-v2`, local, no API cost) for vector similarity recall.
+- **`web.py`** — a read-only FastAPI conversation viewer (port 8080). Shows all named sessions in a sidebar, renders messages as a chat UI, and auto-refreshes every 5 seconds. Password-protected; designed for remote access via Tailscale.
 
 ## What the agent can do
 
@@ -44,12 +48,15 @@ Three modules:
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
 
-Plus Telegram commands:
+Plus Telegram commands (type `/` to see the full menu in the chat):
 
+- `/switch <name>` — switch to a named conversation (e.g. `/switch fundraising`); saves the current session and loads or creates the named one
+- `/sessions` — list all conversations with message counts
 - `/remember <fact>` — save a memory manually
 - `/memories` — list recent memories
 - `/forget <n>` — delete a memory by number
-- `/newsession` — clear the conversation (after auto-extracting facts worth keeping from it)
+- `/newsession` — clear the current conversation (after auto-extracting facts worth keeping)
+- `/log <text>` — extract and save facts from a pasted note or WhatsApp conversation
 
 ## Design details
 
@@ -71,9 +78,15 @@ On first launch, sentence-transformers downloads the weights from the Hugging Fa
 
 The system prompt and tool definitions are frozen with a `cache_control` breakpoint, so they cache for the whole session. Volatile content (retrieved memories) goes into user turns where it can't invalidate that prefix. A second breakpoint is placed on the last content block of each request — on a *copy* of the message, never the stored history, because markers accumulating in history would blow past the API's 4-breakpoint limit. Result: conversation prefixes cache turn-over-turn; the logs report `cache_read` tokens on every call as a health check.
 
+### Named sessions + web viewer
+
+Each conversation lives in `sessions/<name>.json`. `/switch <name>` saves the current history and loads or creates the target session; the first startup migrates the old `session.json` to `sessions/default.json` automatically. Sessions are independent — prompt caching warms separately per session since each has its own history prefix.
+
+`web.py` reads the `sessions/` directory and serves a password-protected chat UI at port 8080. It's a companion process (`web.service`) that runs alongside the bot with no coupling — the bot writes files, the viewer reads them. Designed for remote access via [Tailscale](https://tailscale.com), which creates a private encrypted link between your devices without opening any firewall ports.
+
 ### Session persistence + self-repair
 
-Conversation history persists to `session.json` so the bot survives restarts. The tricky part: if the process dies mid-tool-call, history is left with a `tool_use` block that has no `tool_result` (or vice versa), and the API rejects *every* subsequent request with a 400. `repair_history()` scans for dangling tool blocks and drops them — on load, and again before each turn, since a crashed turn can leave the in-memory history broken without ever touching disk.
+Conversation history persists to `sessions/<name>.json` so the bot survives restarts. The tricky part: if the process dies mid-tool-call, history is left with a `tool_use` block that has no `tool_result` (or vice versa), and the API rejects *every* subsequent request with a 400. `repair_history()` scans for dangling tool blocks and drops them — on load, and again before each turn, since a crashed turn can leave the in-memory history broken without ever touching disk.
 
 ### Context window management
 
@@ -242,6 +255,15 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 ```
+
+To also run the web conversation viewer:
+
+```bash
+sudo cp web.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable web && sudo systemctl start web
+```
+
+Set `WEB_SECRET=<password>` in `.dot.env` before starting. Access the viewer at `http://<your-ip>:8080`. For remote access from anywhere, install [Tailscale](https://tailscale.com) on the server (`curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`) and on your other devices — no firewall changes needed.
 
 And schedule ingestion with cron:
 
