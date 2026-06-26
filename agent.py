@@ -1,4 +1,4 @@
-import os, json, base64, pickle, io, asyncio
+import os, json, base64, pickle, io, asyncio, glob, re, shutil
 from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -696,7 +696,19 @@ def build_user_content(user_text: str) -> str:
     return f"<relevant_memories>\n{block}\n</relevant_memories>\n\n{user_text}"
 
 # ── CONVERSATION STATE ────────────────────────────────────────────────────────
-SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.json")
+_BASE           = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR    = os.path.join(_BASE, "sessions")
+_LEGACY_SESSION = os.path.join(_BASE, "session.json")
+
+def _session_path(name: str) -> str:
+    return os.path.join(SESSIONS_DIR, f"{name}.json")
+
+def _migrate_legacy_session():
+    """Move session.json → sessions/default.json on first run after upgrade."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    if os.path.exists(_LEGACY_SESSION) and not os.path.exists(_session_path("default")):
+        shutil.move(_LEGACY_SESSION, _session_path("default"))
+        logging.info("Migrated session.json → sessions/default.json")
 
 def repair_history(messages: list) -> list:
     """Drop tool_use blocks whose result was never recorded (process died or
@@ -731,23 +743,28 @@ def repair_history(messages: list) -> list:
             return out
         messages = out
 
-def load_session() -> list:
+def load_session(name: str = None) -> list:
+    path = _session_path(name or _current_session_name)
     try:
-        with open(SESSION_FILE) as f:
+        with open(path) as f:
             return repair_history(json.load(f))
     except FileNotFoundError:
         return []
     except Exception as e:
-        logging.error(f"Session load error: {e}")
+        logging.error(f"Session load error ({name}): {e}")
         return []
 
 def save_session():
+    path = _session_path(_current_session_name)
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
     try:
-        with open(SESSION_FILE, "w") as f:
+        with open(path, "w") as f:
             json.dump(conversation_history, f)
     except Exception as e:
-        logging.error(f"Session save error: {e}")
+        logging.error(f"Session save error ({_current_session_name}): {e}")
 
+_current_session_name = "default"
+_migrate_legacy_session()
 conversation_history = load_session()
 
 # ── CLAUDE CALL ───────────────────────────────────────────────────────────────
@@ -955,6 +972,49 @@ async def cmd_log(update, context):
     except Exception as e:
         await update.message.reply_text(f"Log error: {e}")
 
+async def cmd_switch(update, context):
+    global conversation_history, _current_session_name
+    if update.effective_user.id != YOUR_USER_ID: return
+
+    name = "_".join(context.args).strip().lower()
+    if not name or not re.match(r'^[a-z0-9][a-z0-9_-]*$', name):
+        await update.message.reply_text("Usage: /switch <name>  (letters, numbers, hyphens only)\nExample: /switch fundraising")
+        return
+
+    if name == _current_session_name:
+        await update.message.reply_text(f"Already in '{name}' ({len(conversation_history)} messages).")
+        return
+
+    # Save current before switching
+    save_session()
+    old = _current_session_name
+    _current_session_name = name
+    conversation_history = load_session(name)
+
+    count = len(conversation_history)
+    if count:
+        await update.message.reply_text(f"Switched from '{old}' → '{name}' ({count} messages in history).")
+    else:
+        await update.message.reply_text(f"Switched from '{old}' → '{name}' (new conversation).")
+
+async def cmd_sessions(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    files = sorted(glob.glob(os.path.join(SESSIONS_DIR, "*.json")))
+    if not files:
+        await update.message.reply_text(f"Only one conversation: {_current_session_name} (active, {len(conversation_history)} messages)")
+        return
+    lines = []
+    for f in files:
+        sname = os.path.splitext(os.path.basename(f))[0]
+        try:
+            count = len(json.load(open(f)))
+        except Exception:
+            count = "?"
+        marker = " ← active" if sname == _current_session_name else ""
+        lines.append(f"• {sname} ({count} msgs){marker}")
+    await update.message.reply_text("Conversations:\n" + "\n".join(lines))
+
 # ── ERROR HANDLER ─────────────────────────────────────────────────────────────
 async def error_handler(update, context):
     logging.error(f"Exception: {context.error}")
@@ -1160,8 +1220,22 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Reminder delivery error: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
+async def _post_init(app):
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("switch",     "Switch to a named conversation"),
+        BotCommand("sessions",   "List all conversations"),
+        BotCommand("log",        "Log a note or WhatsApp forward"),
+        BotCommand("remember",   "Save a fact to memory"),
+        BotCommand("memories",   "Show recent memories"),
+        BotCommand("forget",     "Delete a memory by number"),
+        BotCommand("newsession", "Clear current conversation history"),
+    ])
+
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+    app.add_handler(CommandHandler("switch",     cmd_switch))
+    app.add_handler(CommandHandler("sessions",   cmd_sessions))
     app.add_handler(CommandHandler("remember",   cmd_remember))
     app.add_handler(CommandHandler("memories",   cmd_memories))
     app.add_handler(CommandHandler("forget",     cmd_forget))

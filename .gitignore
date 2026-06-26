@@ -10,6 +10,7 @@ dot.db
 dot.db.*
 session.json
 session.json.*
+sessions/
 chroma_db/
 chroma_db.corrupt/
 
