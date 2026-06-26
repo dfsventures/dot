@@ -1,6 +1,12 @@
 # Roadmap
 
-All items shipped. Roadmap is currently clear.
+## Planned
+
+### Google Drive access
+
+Add `search_drive` and `read_drive_file` tools. Requires adding the Drive API scope to `auth_work.py`, deleting `token_work.pickle`, and re-running auth. Useful for documents, shared files, and anything that lives in Drive rather than Dropbox.
+
+---
 
 ---
 
