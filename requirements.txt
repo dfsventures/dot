@@ -1,5 +1,6 @@
 anthropic==0.109.1
 fastapi==0.115.12
+python-multipart==0.0.20
 openai-whisper==20240930
 chromadb==1.5.9
 dropbox==12.0.2

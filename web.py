@@ -131,7 +131,12 @@ async def do_login(request: Request):
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, _=Depends(_check_auth)):
+async def index(request: Request):
+    from fastapi.responses import RedirectResponse
+    try:
+        _check_auth(request)
+    except HTTPException:
+        return RedirectResponse(url="/login")
     sessions = _list_sessions()
     default = sessions[0]["name"] if sessions else "default"
     return templates.TemplateResponse("index.html", {
