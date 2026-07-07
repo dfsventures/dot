@@ -23,5 +23,6 @@ __pycache__/
 # Environment
 venv/
 
-# Local tooling config
-.claude/
+# Local tooling config (agent definitions in .claude/agents/ ARE committed)
+.claude/*
+!.claude/agents/

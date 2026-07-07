@@ -280,3 +280,14 @@ Drop files into the `/Dot Dump` folder in Dropbox; within 15 minutes their facts
 ## Customising
 
 The agent's persona, priorities, and tool-routing heuristics live in `BASE_SYSTEM` in `agent.py`, and the fact-extraction behaviour in `EXTRACTION_SYSTEM` in `ingest.py`. Both are written for an Africa-focused investor workflow — edit them to fit yours.
+
+## Development workflow (Claude Code agents)
+
+Development on this repo uses two Claude Code subagents, defined in `.claude/agents/` and picked up automatically by any Claude Code session opened in this directory — no per-machine setup needed.
+
+- **Felix** (`felix.md`) — senior staff engineer + technical PM. Reviews code, verifies roadmap/README claims against the actual source, and turns approved work into numbered workstreams in `docs/IMPLEMENTATION_PLAN.md`. Never writes product code; surfaces product decisions instead of making them silently.
+- **Alvin** (`alvin.md`) — implementation engineer. Executes workstreams from the plan exactly as written, one commit per workstream, and reports deviations rather than improvising around them.
+
+Typical flow: ask Claude to "have Felix review X" or "plan Y with Felix" → approve the decisions Felix flags → "have Alvin do WS-N" → review and push. Findings are numbered F-1, F-2, … and workstreams WS-1, WS-2, … continuing the existing sequences in `docs/IMPLEMENTATION_PLAN.md`.
+
+Note: Felix's definition pins `model: fable` and Alvin's `model: sonnet`; if a machine's Claude Code account lacks one of those models, override with the `model` field when invoking, or edit the frontmatter locally.
