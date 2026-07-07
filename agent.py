@@ -784,14 +784,17 @@ def _with_cache_breakpoint(messages: list) -> list:
         content[-1]["cache_control"] = {"type": "ephemeral"}
     return messages[:-1] + [last]
 
-def call_claude():
-    response = client.messages.create(
+def call_claude(container_id=None):
+    kwargs = dict(
         model="claude-sonnet-4-6",
         max_tokens=4096,
         system=SYSTEM_BLOCKS,
         tools=TOOLS,
         messages=_with_cache_breakpoint(conversation_history),
     )
+    if container_id:
+        kwargs["container_id"] = container_id
+    response = client.messages.create(**kwargs)
     u = response.usage
     logging.info(
         f"usage: in={u.input_tokens} out={u.output_tokens} "
@@ -841,41 +844,53 @@ async def _process_message(update: Update, user_text: str):
         conversation_history = await asyncio.to_thread(compress_history, conversation_history)
 
     await update.message.chat.send_action("typing")
-    response = await asyncio.to_thread(call_claude)
-
-    iterations = 0
-    while response.stop_reason in ("tool_use", "pause_turn") and iterations < MAX_TOOL_ITERATIONS:
-        iterations += 1
-        conversation_history.append({
-            "role": "assistant",
-            "content": [b.model_dump(exclude_none=True) for b in response.content],
-        })
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                result, is_error = await asyncio.to_thread(run_tool, block.name, dict(block.input))
-                tr = {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                if is_error:
-                    tr["is_error"] = True
-                tool_results.append(tr)
-            conversation_history.append({"role": "user", "content": tool_results})
-        # pause_turn: re-send so the API can resume from the trailing server_tool_use block.
-        await update.message.chat.send_action("typing")
+    try:
         response = await asyncio.to_thread(call_claude)
+        container_id = getattr(response, 'container_id', None)
 
-    final = " ".join(b.text for b in response.content if b.type == "text") or "Done."
-    conversation_history.append({"role": "assistant", "content": final})
-    save_session()
+        iterations = 0
+        while response.stop_reason in ("tool_use", "pause_turn") and iterations < MAX_TOOL_ITERATIONS:
+            iterations += 1
+            conversation_history.append({
+                "role": "assistant",
+                "content": [b.model_dump(exclude_none=True) for b in response.content],
+            })
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    result, is_error = await asyncio.to_thread(run_tool, block.name, dict(block.input))
+                    tr = {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                    if is_error:
+                        tr["is_error"] = True
+                    tool_results.append(tr)
+                conversation_history.append({"role": "user", "content": tool_results})
+            # pause_turn: re-send so the API can resume from the trailing server_tool_use block.
+            await update.message.chat.send_action("typing")
+            response = await asyncio.to_thread(call_claude, container_id)
+            container_id = getattr(response, 'container_id', None) or container_id
 
-    for i in range(0, len(final), 4000):
-        await update.message.reply_text(final[i:i+4000])
+        final = " ".join(b.text for b in response.content if b.type == "text") or "Done."
+        conversation_history.append({"role": "assistant", "content": final})
+        save_session()
+
+        for i in range(0, len(final), 4000):
+            await update.message.reply_text(final[i:i+4000])
+    except Exception:
+        # Roll back to the last clean on-disk save so the next turn doesn't
+        # inherit a half-written assistant message and continue it mid-thought.
+        conversation_history = load_session()
+        raise
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
         return
-    await _process_message(update, update.message.text)
+    user_text = update.message.text
+    reply_to = update.message.reply_to_message
+    if reply_to and reply_to.text:
+        user_text = f"[Replying to: \"{reply_to.text[:500]}\"]\n\n{user_text}"
+    await _process_message(update, user_text)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_USER_ID:
@@ -907,6 +922,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(f"_{text}_", parse_mode="Markdown")
+    reply_to = update.message.reply_to_message
+    if reply_to and reply_to.text:
+        text = f"[Replying to: \"{reply_to.text[:500]}\"]\n\n{text}"
     await _process_message(update, text)
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
@@ -971,6 +989,12 @@ async def cmd_log(update, context):
         await update.message.reply_text(f"Logged. {saved} fact(s) saved to memory.")
     except Exception as e:
         await update.message.reply_text(f"Log error: {e}")
+
+async def cmd_restart(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    await update.message.reply_text("Restarting — back in ~10 seconds.")
+    import sys
+    sys.exit(0)
 
 async def cmd_switch(update, context):
     global conversation_history, _current_session_name
@@ -1058,24 +1082,26 @@ REMINDERS DUE TODAY:
 DEALS NEEDING ATTENTION (no update in 14+ days, active stages only):
 {stale_str}
 
-Instructions:
-- Calendar: show time in 12-hour format, event name, and attendee first names only. Skip all-day/personal blocks unless notable. No IDs.
-- Email: show sender name, subject, and received time. No IDs. Flag anything that looks like it needs a reply.
-- Deals: if any stale deals exist, include a "Needs attention" section listing them with how long since last update and the pending next action. Skip the section entirely if none.
-- Use web_search to find 3–5 of today's top news headlines relevant to African tech, fintech, AI, and startup investing. One sentence of context per headline.
-- Sections: Today, Email, Needs attention (if any), News. No greeting, no filler."""
+RULES (non-negotiable):
+1. Your response MUST start with the first section header. Not a single word before it.
+2. Calendar: 12-hour format, event name, attendee first names only. No IDs. Skip all-day/personal blocks unless notable.
+3. Email: sender name, subject, received time. No IDs. Flag if it looks like it needs a reply.
+4. Deals: if stale deals exist, add a "Needs attention" section with how long since last update and pending next action. Omit entirely if none.
+5. News: search for African tech/fintech/AI/startup news published TODAY ({today_label}) only. If a story was published before today, do not include it — not even with a label like "from yesterday". If nothing was published today, write exactly: "Nothing notable today." Do not pad with older stories.
+6. Sections in order: Today, Email, Needs attention (if any), News. No greeting, no sign-off, no filler."""
 
     briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
     msgs = [{"role": "user", "content": prompt}]
 
     try:
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            tools=briefing_tools,
-            messages=msgs,
-        )
+        def _briefing_call(cid=None):
+            kw = dict(model="claude-sonnet-4-6", max_tokens=1500, tools=briefing_tools, messages=msgs)
+            if cid:
+                kw["container_id"] = cid
+            return client.messages.create(**kw)
+
+        response = await asyncio.to_thread(_briefing_call)
+        briefing_container_id = getattr(response, 'container_id', None)
         iterations = 0
         while response.stop_reason in ("tool_use", "pause_turn") and iterations < 5:
             iterations += 1
@@ -1093,13 +1119,8 @@ Instructions:
                             tr["is_error"] = True
                         tool_results.append(tr)
                 msgs.append({"role": "user", "content": tool_results})
-            response = await asyncio.to_thread(
-                client.messages.create,
-                model="claude-sonnet-4-6",
-                max_tokens=1500,
-                tools=briefing_tools,
-                messages=msgs,
-            )
+            response = await asyncio.to_thread(_briefing_call, briefing_container_id)
+            briefing_container_id = getattr(response, 'container_id', None) or briefing_container_id
         text = " ".join(b.text for b in response.content if b.type == "text").strip()
         if text:
             for i in range(0, len(text), 4000):
@@ -1171,13 +1192,14 @@ Specific and direct. Bullet points. No filler."""
         msgs = [{"role": "user", "content": prompt}]
 
         try:
-            response = await asyncio.to_thread(
-                client.messages.create,
-                model="claude-sonnet-4-6",
-                max_tokens=1000,
-                tools=prep_tools,
-                messages=msgs,
-            )
+            def _prep_call(cid=None):
+                kw = dict(model="claude-sonnet-4-6", max_tokens=1000, tools=prep_tools, messages=msgs)
+                if cid:
+                    kw["container_id"] = cid
+                return client.messages.create(**kw)
+
+            response = await asyncio.to_thread(_prep_call)
+            prep_container_id = getattr(response, 'container_id', None)
             iterations = 0
             while response.stop_reason in ("tool_use", "pause_turn") and iterations < 8:
                 iterations += 1
@@ -1195,13 +1217,8 @@ Specific and direct. Bullet points. No filler."""
                                 tr["is_error"] = True
                             tool_results.append(tr)
                     msgs.append({"role": "user", "content": tool_results})
-                response = await asyncio.to_thread(
-                    client.messages.create,
-                    model="claude-sonnet-4-6",
-                    max_tokens=1000,
-                    tools=prep_tools,
-                    messages=msgs,
-                )
+                response = await asyncio.to_thread(_prep_call, prep_container_id)
+                prep_container_id = getattr(response, 'container_id', None) or prep_container_id
             text = " ".join(b.text for b in response.content if b.type == "text").strip()
             if text:
                 header = f"Prep — {title} (in ~30 min)\n\n"
@@ -1223,6 +1240,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def _post_init(app):
     from telegram import BotCommand
     await app.bot.set_my_commands([
+        BotCommand("restart",    "Restart the bot"),
         BotCommand("switch",     "Switch to a named conversation"),
         BotCommand("sessions",   "List all conversations"),
         BotCommand("log",        "Log a note or WhatsApp forward"),
@@ -1234,6 +1252,7 @@ async def _post_init(app):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+    app.add_handler(CommandHandler("restart",    cmd_restart))
     app.add_handler(CommandHandler("switch",     cmd_switch))
     app.add_handler(CommandHandler("sessions",   cmd_sessions))
     app.add_handler(CommandHandler("remember",   cmd_remember))
