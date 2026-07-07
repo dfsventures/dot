@@ -43,6 +43,7 @@ Four modules:
 | `list/get/create/update/delete_calendar_event` | Full read-write Google Calendar management, including attendee invites and auto-generated Meet links |
 | `search_granola` / `read_granola` | Search meeting notes and read summaries + transcripts from Granola |
 | `search_dropbox` / `read_dropbox_file` | Find and read Dropbox files (PDF, DOCX, TXT, MD) |
+| `search_drive` / `read_drive_file` | Find and read Google Drive files (Google Docs/Sheets/Slides exported as text, plus PDF, DOCX, TXT, MD, CSV) — read-only |
 | `web_search` | Anthropic's native server-side web search |
 | `set_reminder` / `list_reminders` / `delete_reminder` | Time-based reminders delivered as Telegram messages |
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
@@ -142,7 +143,7 @@ A `deals` table in `dot.db` holds a lightweight CRM: company name (unique), pipe
 - **Single-user lockdown**: every handler checks the sender's Telegram user ID against `YOUR_TELEGRAM_USER_ID` and silently ignores anyone else.
 - **All secrets live in `.dot.env`** (gitignored). See `.env.example` for the full list.
 - Google OAuth tokens (`token_work.pickle`, `credentials.json`), the memory database, vector index, and conversation history are all gitignored — they contain personal data.
-- Gmail scopes are `gmail.readonly` + `gmail.compose` (needed for draft creation — note `gmail.compose` technically permits sending, but Dot's code only ever calls `drafts().create`, never send). Calendar is read-write by design.
+- Gmail scopes are `gmail.readonly` + `gmail.compose` (needed for draft creation — note `gmail.compose` technically permits sending, but Dot's code only ever calls `drafts().create`, never send). Calendar is read-write by design. Drive scope is `drive.readonly` — no writes are possible.
 - **Attendee-affecting calendar writes require an explicit `/confirm` in code.** Creating an event with attendees, updating an event to add attendees, or deleting an event that has attendees are intercepted at the tool-execution layer — the Calendar API is never called until Joey sends `/confirm`. This prevents a prompt-injected instruction (from an email, document, or meeting invite) from emailing third parties without Joey's explicit tap.
 
 ## Hardware

@@ -35,6 +35,7 @@ def load_google_creds(pickle_path):
 work_creds     = load_google_creds('token_work.pickle')
 gmail_work     = build('gmail',    'v1', credentials=work_creds)
 calendar_work  = build('calendar', 'v3', credentials=work_creds)
+drive_work     = build('drive',    'v3', credentials=work_creds)
 
 # ── DROPBOX ───────────────────────────────────────────────────────────────────
 dbx = dbx_lib.Dropbox(
@@ -498,6 +499,53 @@ def read_dropbox_file(file_path: str):
     except Exception as e:
         return f"Dropbox read error: {e}"
 
+def search_drive(query: str, max_results: int = 10):
+    try:
+        safe_q = query.replace("'", "\\'")
+        results = drive_work.files().list(
+            q=f"name contains '{safe_q}' and trashed = false",
+            pageSize=max_results, orderBy="modifiedTime desc",
+            fields="files(id, name, mimeType, modifiedTime)"
+        ).execute()
+        files = results.get('files', [])
+        if not files:
+            return "No Drive files found."
+        return "\n".join(
+            f"Name: {f['name']} | Type: {f['mimeType'].split('.')[-1]} | "
+            f"Modified: {f.get('modifiedTime', '')[:10]} | ID: {f['id']}"
+            for f in files
+        )
+    except Exception as e:
+        return f"Drive search error: {e}"
+
+_DRIVE_EXPORTS = {
+    'application/vnd.google-apps.document':     'text/plain',
+    'application/vnd.google-apps.spreadsheet':  'text/csv',
+    'application/vnd.google-apps.presentation': 'text/plain',
+}
+
+def read_drive_file(file_id: str):
+    try:
+        meta = drive_work.files().get(fileId=file_id, fields="name, mimeType").execute()
+        name, mime = meta['name'].lower(), meta['mimeType']
+        if mime in _DRIVE_EXPORTS:
+            content = drive_work.files().export(fileId=file_id, mimeType=_DRIVE_EXPORTS[mime]).execute()
+            return content.decode('utf-8', errors='ignore')[:3000] if isinstance(content, bytes) else str(content)[:3000]
+        content = drive_work.files().get_media(fileId=file_id).execute()
+        if name.endswith(('.txt', '.md', '.csv')):
+            return content.decode('utf-8', errors='ignore')[:3000]
+        elif name.endswith('.pdf'):
+            import PyPDF2
+            reader = PyPDF2.PdfReader(io.BytesIO(content))
+            return " ".join(page.extract_text() or "" for page in reader.pages)[:3000]
+        elif name.endswith('.docx'):
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            return "\n".join(p.text for p in doc.paragraphs)[:3000]
+        return f"[File type not readable as text: {meta['name']}]"
+    except Exception as e:
+        return f"Drive read error: {e}"
+
 # ── TOOLS SCHEMA ──────────────────────────────────────────────────────────────
 TOOLS = [
     {"type": "web_search_20260209", "name": "web_search"},
@@ -595,6 +643,19 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
     },
     {
+        "name": "search_drive",
+        "description": "Search Joey's Google Drive by file name. Use for documents and shared files that live in Drive rather than Dropbox.",
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"},
+            "max_results": {"type": "integer", "default": 10}
+        }, "required": ["query"]}
+    },
+    {
+        "name": "read_drive_file",
+        "description": "Read a Google Drive file by ID (get ID from search_drive first). Supports Google Docs/Sheets/Slides (exported as text) plus PDF, DOCX, TXT, MD, CSV.",
+        "input_schema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}
+    },
+    {
         "name": "set_reminder",
         "description": "Set a reminder that fires as a Telegram message at the specified time. Use when Joey says 'remind me to...', 'follow up with X in N days', 'ping me about Y on [date]'. Always confirm the note text and time before setting.",
         "input_schema": {"type": "object", "properties": {
@@ -654,6 +715,8 @@ TOOL_FUNCTIONS = {
     "read_granola":         read_granola,
     "search_dropbox":       search_dropbox,
     "read_dropbox_file":    read_dropbox_file,
+    "search_drive":         search_drive,
+    "read_drive_file":      read_drive_file,
     "set_reminder":         set_reminder,
     "list_reminders":       list_reminders,
     "delete_reminder":      delete_reminder,
@@ -674,6 +737,7 @@ Your tools and what they contain:
 - list_calendar_events / get_calendar_event / create_calendar_event / update_calendar_event / delete_calendar_event: Joey's work Google Calendar (read and write)
 - search_granola / read_granola: Call and meeting notes from Granola
 - search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
+- search_drive / read_drive_file: Joey's Google Drive (read-only)
 - web_search: Real-time web search
 - set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
