@@ -347,7 +347,7 @@ def search_granola(query: str, max_results: int = 10):
         r = requests.get(
             "https://public-api.granola.ai/v1/notes",
             headers=headers,
-            params={"page_size": 30},
+            params={"page_size": 60},
             timeout=10
         )
         if r.status_code == 401:
@@ -358,7 +358,16 @@ def search_granola(query: str, max_results: int = 10):
         if not notes:
             return "No Granola notes found."
         query_lower = query.lower()
-        matched = [n for n in notes if query_lower in (n.get("title") or "").lower()]
+        def _note_matches(n):
+            if query_lower in (n.get("title") or "").lower():
+                return True
+            for a in n.get("attendees", []):
+                if query_lower in (a.get("name") or "").lower():
+                    return True
+                if query_lower in (a.get("email") or "").lower():
+                    return True
+            return False
+        matched = [n for n in notes if _note_matches(n)]
         results = matched if matched else notes
         lines = []
         for n in results[:max_results]:
@@ -461,6 +470,12 @@ def list_deals(stage: str = None) -> str:
         for d in deals
     )
 
+def search_memory(query: str) -> str:
+    results = retrieve_relevant_memories(query, k=30)
+    if not results:
+        return "No memories found matching that query."
+    return "\n".join(f"• {m}" for m in results)
+
 def set_reminder(note: str, due_at: str) -> str:
     r = _set_reminder(note, due_at)
     return f"Reminder set: '{r['note']}' at {r['due_at']} (ID {r['id']})"
@@ -503,7 +518,7 @@ def search_drive(query: str, max_results: int = 10):
     try:
         safe_q = query.replace("'", "\\'")
         results = drive_work.files().list(
-            q=f"name contains '{safe_q}' and trashed = false",
+            q=f"(name contains '{safe_q}' or fullText contains '{safe_q}') and trashed = false",
             pageSize=max_results, orderBy="modifiedTime desc",
             fields="files(id, name, mimeType, modifiedTime)"
         ).execute()
@@ -699,6 +714,13 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {
             "stage": {"type": "string", "description": "Optional filter: sourcing | first_call | due_diligence | passed | invested"}
         }}
+    },
+    {
+        "name": "search_memory",
+        "description": "Actively search long-term memory for facts matching a query. Use when you know something should be in memory but it wasn't in the passively-retrieved set, or when Joey explicitly asks to search memories.",
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "What to search for"}
+        }, "required": ["query"]}
     }
 ]
 
@@ -723,6 +745,7 @@ TOOL_FUNCTIONS = {
     "update_deal":          update_deal,
     "get_deal_info":        get_deal_info,
     "list_deals":           list_deals,
+    "search_memory":        search_memory,
 }
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -741,6 +764,8 @@ Your tools and what they contain:
 - web_search: Real-time web search
 - set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
+- search_memory: actively search long-term memory when passive retrieval may have missed something
+If Joey asks to be prepped for a meeting or asks for background on a person or company before a call, proactively search Granola, Gmail, Dropbox, and Drive for context and produce a tight prep brief without being asked to use specific tools.
 
 When a question involves a person or company, search Granola first (most recent call context),
 then work email. For documents, search Dropbox. For scheduling questions, check calendar.
@@ -748,7 +773,9 @@ Search proactively — don't ask permission. For calendar writes (create/update/
 Calendar changes that would notify attendees by email (creating an event with attendees, updating to add attendees, or deleting an event that has attendees) are held automatically by the system and NOT executed until Joey sends /confirm. When a tool result says "PENDING CONFIRMATION", tell Joey exactly what is held and that he must send /confirm to proceed or /cancel to discard. Do not retry the tool call while a confirmation is pending.
 Facts retrieved from your long-term memory store appear inside <relevant_memories> tags
 at the top of user messages — treat them as background context about Joey and his work.
-Be direct and specific. No filler, no hedging."""
+Be direct and specific. No filler, no hedging.
+Never narrate your reasoning or process. Do not say 'Let me look that up', 'I'll check', 'Looking at your calendar', 'I'll search for', 'Now I have enough to...', or any similar meta-commentary. Work silently and present results directly.
+Format responses with Telegram markdown: *bold* for headings and key terms, bullet points for lists. Keep responses tight and visually clean."""
 
 # Frozen system prompt with a cache breakpoint: tools + system cache together
 # and stay valid for the whole session. Volatile content (retrieved memories)
@@ -901,7 +928,7 @@ def run_tool(name: str, tool_input: dict):
 _whisper_model = None
 _prepped_events: set = set()
 _INTERNAL_DOMAINS = {'dfslab.net', 'dfs.vc'}
-_PREP_TOOL_NAMES  = {'search_gmail_work', 'read_gmail_work', 'search_granola', 'read_granola'}
+_PREP_TOOL_NAMES  = {'search_gmail_work', 'read_gmail_work', 'search_granola', 'read_granola', 'search_dropbox', 'read_dropbox_file', 'search_drive', 'read_drive_file'}
 
 _pending_action = None  # {"name": str, "input": dict, "summary": str}
 _GATED_TOOLS = {"create_calendar_event", "update_calendar_event", "delete_calendar_event"}
@@ -975,7 +1002,7 @@ async def _process_message(update: Update, user_text: str):
         save_session()
 
         for i in range(0, len(final), 4000):
-            await update.message.reply_text(final[i:i+4000])
+            await update.message.reply_text(final[i:i+4000], parse_mode="Markdown")
     except Exception:
         # Roll back to the last clean on-disk save so the next turn doesn't
         # inherit a half-written assistant message and continue it mid-thought.
@@ -1081,11 +1108,15 @@ async def cmd_log(update, context):
         )
         facts = parse_json_array(resp.content[0].text)
         saved = 0
+        saved_facts = []
         for fact in facts:
             if fact and len(fact) > 10:
                 save_memory(fact, "log")
                 saved += 1
-        await update.message.reply_text(f"Logged. {saved} fact(s) saved to memory.")
+                saved_facts.append(fact)
+        facts_display = "\n".join(f"• {f}" for f in saved_facts)
+        reply = f"Logged {saved} fact(s):\n{facts_display}\n\nIf this relates to a deal, just tell me and I'll update the pipeline."
+        await update.message.reply_text(reply)
     except Exception as e:
         await update.message.reply_text(f"Log error: {e}")
 
@@ -1104,7 +1135,7 @@ async def cmd_confirm(update, context):
     action, _pending_action = _pending_action, None
     fn = TOOL_FUNCTIONS[action["name"]]
     result = await asyncio.to_thread(lambda: str(fn(**action["input"])))
-    await update.message.reply_text(result[:4000])
+    await update.message.reply_text(result[:4000], parse_mode="Markdown")
 
 async def cmd_cancel(update, context):
     global _pending_action
@@ -1158,6 +1189,19 @@ async def cmd_sessions(update, context):
         lines.append(f"• {sname} ({count} msgs){marker}")
     await update.message.reply_text("Conversations:\n" + "\n".join(lines))
 
+async def cmd_search(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /search <query>")
+        return
+    results = await asyncio.to_thread(retrieve_relevant_memories, query, 30)
+    if not results:
+        await update.message.reply_text("No memories found.")
+        return
+    text = "\n".join(f"{i+1}. {m}" for i, m in enumerate(results))
+    await update.message.reply_text(text[:4000])
+
 # ── ERROR HANDLER ─────────────────────────────────────────────────────────────
 async def error_handler(update, context):
     logging.error(f"Exception: {context.error}")
@@ -1177,7 +1221,7 @@ async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
     today_label = _today.strftime("%A, %B %-d")
     today_str   = _today.strftime("%Y-%m-%d")
 
-    cal   = await asyncio.to_thread(list_calendar_events, 1, 10)
+    cal   = await asyncio.to_thread(list_calendar_events, 3, 15)
     email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
     due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
     reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
@@ -1187,11 +1231,15 @@ async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
         for d in stale
     ) or "None"
 
+    from memory import list_deals as _ld
+    pipeline_companies = [d['company'] for d in _ld('invested') + _ld('due_diligence')]
+    pipeline_str = ", ".join(pipeline_companies) if pipeline_companies else ""
+
     prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
 
 RAW DATA:
 
-CALENDAR (today):
+CALENDAR (next 3 days):
 {cal}
 
 UNREAD EMAIL (last 24h):
@@ -1205,10 +1253,10 @@ DEALS NEEDING ATTENTION (no update in 14+ days, active stages only):
 
 RULES (non-negotiable):
 1. Your response MUST start with the first section header. Not a single word before it.
-2. Calendar: 12-hour format, event name, attendee first names only. No IDs. Skip all-day/personal blocks unless notable.
+2. Calendar: 12-hour format, show date alongside time, event name, attendee first names only. No IDs. Skip all-day/personal blocks unless notable.
 3. Email: sender name, subject, received time. No IDs. Flag if it looks like it needs a reply.
 4. Deals: if stale deals exist, add a "Needs attention" section with how long since last update and pending next action. Omit entirely if none.
-5. News: search for African tech/fintech/AI/startup news published TODAY ({today_label}) only. If a story was published before today, do not include it — not even with a label like "from yesterday". If nothing was published today, write exactly: "Nothing notable today." Do not pad with older stories.
+5. News: search for African tech/fintech/AI/startup news published TODAY ({today_label}) only. If a story was published before today, do not include it — not even with a label like "from yesterday". If nothing was published today, write exactly: "Nothing notable today." Do not pad with older stories. {f'Also search specifically for any news today about these companies: {pipeline_str}.' if pipeline_str else ''}
 6. Sections in order: Today, Email, Needs attention (if any), News. No greeting, no sign-off, no filler."""
 
     briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
@@ -1301,10 +1349,12 @@ Attendees: {', '.join(names)} ({', '.join(emails)})
 Steps:
 1. Search Granola for previous call notes with these contacts.
 2. Search Gmail for recent email threads with them.
+3. Search Dropbox and Drive for any pitch decks, due diligence documents, or investment memos related to these contacts or their company.
 
 Write a tight prep brief:
 - Who they are and what their company does (2-3 sentences, from what you find)
 - Key context from previous interactions (calls, emails)
+- Any relevant documents found (deck highlights, memo conclusions)
 - 1-2 suggested talking points or things to follow up on
 
 Specific and direct. Bullet points. No filler."""
@@ -1371,6 +1421,7 @@ async def _post_init(app):
         BotCommand("memories",   "Show recent memories"),
         BotCommand("forget",     "Delete a memory by number"),
         BotCommand("newsession", "Clear current conversation history"),
+        BotCommand("search",     "Search long-term memory"),
     ])
 
 def main():
@@ -1385,6 +1436,7 @@ def main():
     app.add_handler(CommandHandler("forget",     cmd_forget))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(CommandHandler("log",        cmd_log))
+    app.add_handler(CommandHandler("search",     cmd_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(error_handler)

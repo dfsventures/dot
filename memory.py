@@ -172,6 +172,13 @@ def upsert_deal(company: str, stage: str = None, last_touchpoint: str = None,
                 next_action: str = None, notes: str = None) -> dict:
     existing = get_deal(company)
     if existing:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        existing_notes = existing.get('notes') or ''
+        if last_touchpoint and existing_notes is not None:
+            stamp = datetime.now(ZoneInfo("America/Toronto")).strftime("%Y-%m-%d")
+            appended = f"[{stamp}] {last_touchpoint}"
+            notes = (existing_notes + "\n" + appended).strip() if existing_notes else appended
         fields, values = [], []
         for col, val in [('stage', stage), ('last_touchpoint', last_touchpoint),
                          ('next_action', next_action), ('notes', notes)]:
