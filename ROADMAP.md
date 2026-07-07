@@ -55,3 +55,15 @@ When `ingest.py` extracts facts from a document, it checks each fact against act
 ### Web conversation viewer ✓ — 2026-06-26
 
 `web.py` is a FastAPI app (port 8080) that shows all conversation sessions in a read-only chat UI. Password-protected via `WEB_SECRET` in `.dot.env`. Auto-refreshes every 5 seconds. Designed for access over Tailscale — private, no open ports, no firewall rules. Run as a separate `web.service` systemd unit.
+
+### Remote restart + reply context + briefing fixes ✓ — 2026-07-01
+
+**`/restart` command:** sends a confirmation message then calls `sys.exit(0)`; systemd's `Restart=always` brings the bot back up in ~10 seconds. No sudo, no terminal needed — deploy code changes from anywhere.
+
+**Telegram reply context:** when you use Telegram's reply feature on a message, the quoted text is prepended to your input so Dot knows what you're referencing without having to search back through the conversation.
+
+**Web search `container_id` fix:** the `web_search_20260209` tool runs server-side in an Anthropic container. The response includes a `container_id` that must be echoed on all subsequent calls in the same turn — missing it caused a 400 on every search. All three API loops (main agent, morning briefing, meeting prep) now thread `container_id` through correctly.
+
+**History rollback on error:** if an API call fails mid-turn, `conversation_history` is restored from the last clean on-disk save. Previously, a failed turn left a partial assistant message in memory; the next user message would cause Claude to continue the half-written thought before answering.
+
+**Briefing prompt hardening:** instructions are now numbered and labelled non-negotiable. The first rule requires the response to start with the first section header — no preamble. The news rule explicitly forbids including stories from previous days and prescribes "Nothing notable today" when nothing is fresh.

@@ -50,6 +50,7 @@ Four modules:
 
 Plus Telegram commands (type `/` to see the full menu in the chat):
 
+- `/restart` — restart the bot remotely; systemd brings it back up in ~10 seconds
 - `/switch <name>` — switch to a named conversation (e.g. `/switch fundraising`); saves the current session and loads or creates the named one
 - `/sessions` — list all conversations with message counts
 - `/remember <fact>` — save a memory manually
@@ -57,6 +58,8 @@ Plus Telegram commands (type `/` to see the full menu in the chat):
 - `/forget <n>` — delete a memory by number
 - `/newsession` — clear the current conversation (after auto-extracting facts worth keeping)
 - `/log <text>` — extract and save facts from a pasted note or WhatsApp conversation
+
+**Telegram reply context:** when you use Telegram's reply feature on a specific message, the quoted message text is automatically prepended to your input so Dot knows what you're referencing.
 
 ## Design details
 
@@ -95,7 +98,8 @@ History is token-estimated (~4 chars/token) and compressed once it exceeds an 80
 ### Agent loop edge cases
 
 - Tool execution never raises — a raised exception would leave a dangling `tool_use` in history (same 400-forever failure mode). Errors return as `is_error` tool results instead.
-- `pause_turn` (server-side web search hitting its iteration limit) is handled by simply re-sending; the API resumes from the trailing server tool block.
+- `pause_turn` (server-side web search) is handled by re-sending with the `container_id` from the response — required by the API to resume in the same search container. Missing this causes a 400 on every web search follow-up.
+- If any API call fails mid-turn, `conversation_history` is rolled back to the last clean on-disk save. Without this, a failed turn leaves a half-written assistant message in memory; on the next user message Claude would continue it mid-thought before answering.
 - A 15-iteration cap prevents runaway tool loops.
 - Replies are chunked at 4,000 chars for Telegram's message limit.
 
