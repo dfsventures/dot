@@ -775,7 +775,7 @@ Facts retrieved from your long-term memory store appear inside <relevant_memorie
 at the top of user messages — treat them as background context about Joey and his work.
 Be direct and specific. No filler, no hedging.
 Never narrate your reasoning or process. Do not say 'Let me look that up', 'I'll check', 'Looking at your calendar', 'I'll search for', 'Now I have enough to...', or any similar meta-commentary. Work silently and present results directly.
-Format responses with Telegram markdown: *bold* for headings and key terms, bullet points for lists. Keep responses tight and visually clean."""
+Keep responses concise and plain. Use bullet points for lists. No emoji headers, no heavy markdown structure, no formatted "report" layout. Write like a sharp colleague — not like an AI generating a document."""
 
 # Frozen system prompt with a cache breakpoint: tools + system cache together
 # and stay valid for the whole session. Volatile content (retrieved memories)
@@ -1002,7 +1002,7 @@ async def _process_message(update: Update, user_text: str):
         save_session()
 
         for i in range(0, len(final), 4000):
-            await update.message.reply_text(final[i:i+4000], parse_mode="Markdown")
+            await update.message.reply_text(final[i:i+4000])
     except Exception:
         # Roll back to the last clean on-disk save so the next turn doesn't
         # inherit a half-written assistant message and continue it mid-thought.
@@ -1135,7 +1135,7 @@ async def cmd_confirm(update, context):
     action, _pending_action = _pending_action, None
     fn = TOOL_FUNCTIONS[action["name"]]
     result = await asyncio.to_thread(lambda: str(fn(**action["input"])))
-    await update.message.reply_text(result[:4000], parse_mode="Markdown")
+    await update.message.reply_text(result[:4000])
 
 async def cmd_cancel(update, context):
     global _pending_action
@@ -1357,7 +1357,8 @@ Write a tight prep brief:
 - Any relevant documents found (deck highlights, memo conclusions)
 - 1-2 suggested talking points or things to follow up on
 
-Specific and direct. Bullet points. No filler."""
+Start immediately with the brief — no preamble, no "I have enough to write...", no "Here's the full picture". Just the content.
+Plain prose and bullets. No emoji headers. No markdown section dividers. Write like a sharp colleague gave you a quick verbal rundown."""
 
         prep_tools = [t for t in TOOLS if t.get('name') in _PREP_TOOL_NAMES]
         msgs = [{"role": "user", "content": prompt}]
