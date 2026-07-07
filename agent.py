@@ -146,25 +146,31 @@ def _search_gmail_svc(svc, query, max_results=10):
     if not messages:
         return "No emails found."
     output = []
-    for msg in messages[:5]:
+    for msg in messages[:max_results]:
         m = svc.users().messages().get(userId='me', id=msg['id'], format='metadata',
             metadataHeaders=['Subject', 'From', 'Date']).execute()
         headers = {h['name']: h['value'] for h in m['payload']['headers']}
         output.append(f"From: {headers.get('From','?')} | Date: {headers.get('Date','?')} | Subject: {headers.get('Subject','?')} | ID: {msg['id']}")
     return "\n".join(output)
 
+def _walk_payload_for_text(payload, mime="text/plain"):
+    """Depth-first search of a Gmail payload tree for the first body of the given mime type."""
+    if payload.get('mimeType') == mime and payload.get('body', {}).get('data'):
+        return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+    for part in payload.get('parts', []):
+        text = _walk_payload_for_text(part, mime)
+        if text:
+            return text
+    return ""
+
 def _read_gmail_svc(svc, message_id):
     m = svc.users().messages().get(userId='me', id=message_id, format='full').execute()
-    payload = m['payload']
-    body = ""
-    if 'parts' in payload:
-        for part in payload['parts']:
-            if part['mimeType'] == 'text/plain' and 'data' in part.get('body', {}):
-                body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
-                break
-    elif 'body' in payload and 'data' in payload['body']:
-        body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
-    return body[:3000] if body else "[No text body found]"
+    body = _walk_payload_for_text(m['payload'])
+    if not body:
+        html = _walk_payload_for_text(m['payload'], mime="text/html")
+        if html:
+            body = re.sub(r'<[^>]+>', ' ', html)  # crude tag strip — good enough for reading
+    return body[:3000] if body.strip() else "[No text body found]"
 
 # ── TOOL FUNCTIONS ────────────────────────────────────────────────────────────
 def search_gmail_work(query: str, max_results: int = 10):
@@ -675,6 +681,7 @@ Your tools and what they contain:
 When a question involves a person or company, search Granola first (most recent call context),
 then work email. For documents, search Dropbox. For scheduling questions, check calendar.
 Search proactively — don't ask permission. For calendar writes (create/update/delete) and email drafts, always confirm the key details in your response before executing — state what you're about to create or change and give Joey a chance to correct it before calling the tool. Email drafts are never sent automatically; Joey reviews and sends from Gmail.
+Calendar changes that would notify attendees by email (creating an event with attendees, updating to add attendees, or deleting an event that has attendees) are held automatically by the system and NOT executed until Joey sends /confirm. When a tool result says "PENDING CONFIRMATION", tell Joey exactly what is held and that he must send /confirm to proceed or /cancel to discard. Do not retry the tool call while a confirmation is pending.
 Facts retrieved from your long-term memory store appear inside <relevant_memories> tags
 at the top of user messages — treat them as background context about Joey and his work.
 Be direct and specific. No filler, no hedging."""
@@ -809,9 +816,18 @@ MAX_TOOL_ITERATIONS = 15
 def run_tool(name: str, tool_input: dict):
     """Execute a tool, never raising — a raised exception here would leave a
     dangling tool_use in history and 400 every subsequent API call."""
+    global _pending_action
     fn = TOOL_FUNCTIONS.get(name)
     if not fn:
         return f"[{name} is a native tool — handled by API]", False
+    if name in _GATED_TOOLS and _needs_confirmation(name, tool_input):
+        summary = f"{name}({json.dumps(tool_input, default=str)[:500]})"
+        _pending_action = {"name": name, "input": tool_input, "summary": summary}
+        return (
+            "PENDING CONFIRMATION — this calendar change notifies attendees by email, "
+            "so it was NOT executed. Tell Joey exactly what is pending and that he must "
+            f"send /confirm to execute it or /cancel to discard it. Pending: {summary}"
+        ), False
     try:
         return str(fn(**tool_input)), False
     except Exception as e:
@@ -822,6 +838,25 @@ _whisper_model = None
 _prepped_events: set = set()
 _INTERNAL_DOMAINS = {'dfslab.net', 'dfs.vc'}
 _PREP_TOOL_NAMES  = {'search_gmail_work', 'read_gmail_work', 'search_granola', 'read_granola'}
+
+_pending_action = None  # {"name": str, "input": dict, "summary": str}
+_GATED_TOOLS = {"create_calendar_event", "update_calendar_event", "delete_calendar_event"}
+
+def _needs_confirmation(name: str, tool_input: dict) -> bool:
+    """True when the call would email third parties via calendar attendee notifications."""
+    if name == "create_calendar_event":
+        return bool(tool_input.get("attendees"))
+    if name == "update_calendar_event":
+        return bool(tool_input.get("add_attendees"))
+    if name == "delete_calendar_event":
+        try:
+            e = calendar_work.events().get(
+                calendarId='primary', eventId=tool_input.get("event_id", "")
+            ).execute()
+            return bool(e.get('attendees'))
+        except Exception:
+            return True  # can't verify — fail safe, require confirmation
+    return False
 
 def _get_whisper():
     global _whisper_model
@@ -996,6 +1031,26 @@ async def cmd_restart(update, context):
     import sys
     sys.exit(0)
 
+async def cmd_confirm(update, context):
+    global _pending_action
+    if update.effective_user.id != YOUR_USER_ID: return
+    if not _pending_action:
+        await update.message.reply_text("Nothing pending.")
+        return
+    action, _pending_action = _pending_action, None
+    fn = TOOL_FUNCTIONS[action["name"]]
+    result = await asyncio.to_thread(lambda: str(fn(**action["input"])))
+    await update.message.reply_text(result[:4000])
+
+async def cmd_cancel(update, context):
+    global _pending_action
+    if update.effective_user.id != YOUR_USER_ID: return
+    if _pending_action:
+        await update.message.reply_text(f"Cancelled: {_pending_action['summary']}")
+        _pending_action = None
+    else:
+        await update.message.reply_text("Nothing pending.")
+
 async def cmd_switch(update, context):
     global conversation_history, _current_session_name
     if update.effective_user.id != YOUR_USER_ID: return
@@ -1050,11 +1105,13 @@ async def error_handler(update, context):
 
 # ── MORNING BRIEFING (runs daily at BRIEFING_TIME) ────────────────────────────
 async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
-    from datetime import date
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     from memory import list_reminders as _lr
 
-    today_label = date.today().strftime("%A, %B %-d")
-    today_str   = date.today().strftime("%Y-%m-%d")
+    _today = datetime.now(ZoneInfo("America/Toronto")).date()
+    today_label = _today.strftime("%A, %B %-d")
+    today_str   = _today.strftime("%Y-%m-%d")
 
     cal   = await asyncio.to_thread(list_calendar_events, 1, 10)
     email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
@@ -1241,6 +1298,8 @@ async def _post_init(app):
     from telegram import BotCommand
     await app.bot.set_my_commands([
         BotCommand("restart",    "Restart the bot"),
+        BotCommand("confirm",    "Execute a pending attendee-affecting calendar change"),
+        BotCommand("cancel",     "Discard a pending calendar change"),
         BotCommand("switch",     "Switch to a named conversation"),
         BotCommand("sessions",   "List all conversations"),
         BotCommand("log",        "Log a note or WhatsApp forward"),
@@ -1253,6 +1312,8 @@ async def _post_init(app):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("restart",    cmd_restart))
+    app.add_handler(CommandHandler("confirm",    cmd_confirm))
+    app.add_handler(CommandHandler("cancel",     cmd_cancel))
     app.add_handler(CommandHandler("switch",     cmd_switch))
     app.add_handler(CommandHandler("sessions",   cmd_sessions))
     app.add_handler(CommandHandler("remember",   cmd_remember))

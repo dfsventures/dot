@@ -136,7 +136,8 @@ def set_reminder(note: str, due_at: str) -> dict:
 
 def get_due_reminders() -> list:
     from datetime import datetime
-    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/Toronto")).strftime('%Y-%m-%d %H:%M')
     rows = conn.execute(
         "SELECT id, note, due_at FROM reminders WHERE due_at <= ?", (now,)
     ).fetchall()
