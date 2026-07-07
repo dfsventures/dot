@@ -924,7 +924,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     reply_to = update.message.reply_to_message
     if reply_to and reply_to.text:
-        user_text = f"[Replying to: \"{reply_to.text[:500]}\"]\n\n{user_text}"
+        user_text = f"[User is replying to your message: \"{reply_to.text[:500]}\"]\n\n{user_text}"
     await _process_message(update, user_text)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +959,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"_{text}_", parse_mode="Markdown")
     reply_to = update.message.reply_to_message
     if reply_to and reply_to.text:
-        text = f"[Replying to: \"{reply_to.text[:500]}\"]\n\n{text}"
+        text = f"[User is replying to your message: \"{reply_to.text[:500]}\"]\n\n{text}"
     await _process_message(update, text)
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
