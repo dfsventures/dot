@@ -129,7 +129,7 @@ Reminders are stored in a `reminders` table in `dot.db` with a note and a `due_a
 
 ### Morning briefing
 
-Every morning at a configurable time (default `08:00` Toronto; set `BRIEFING_TIME=HH:MM` in `.dot.env`), Dot sends an unprompted Telegram message with today's calendar events, unread emails from the last 24 hours, and any reminders due that day. It calls the existing tool functions directly — no extra API call — and runs via PTB's `job_queue.run_daily`, so no extra cron entry is needed.
+Every morning at a configurable time (default `08:00` Toronto; set `BRIEFING_TIME=HH:MM` in `.dot.env`), Dot sends an unprompted Telegram message with today's calendar events, unread emails from the last 24 hours, reminders due that day, stale-deal alerts (active deals untouched for 14+ days), and today's news headlines via web search. It calls the existing tool functions directly — no extra API call — and runs via PTB's `job_queue.run_daily`, so no extra cron entry is needed.
 
 ### Deal tracking
 
@@ -140,7 +140,7 @@ A `deals` table in `dot.db` holds a lightweight CRM: company name (unique), pipe
 - **Single-user lockdown**: every handler checks the sender's Telegram user ID against `YOUR_TELEGRAM_USER_ID` and silently ignores anyone else.
 - **All secrets live in `.dot.env`** (gitignored). See `.env.example` for the full list.
 - Google OAuth tokens (`token_work.pickle`, `credentials.json`), the memory database, vector index, and conversation history are all gitignored — they contain personal data.
-- Gmail scope is read-only; Calendar is read-write by design.
+- Gmail scopes are `gmail.readonly` + `gmail.compose` (needed for draft creation — note `gmail.compose` technically permits sending, but Dot's code only ever calls `drafts().create`, never send). Calendar is read-write by design.
 
 ## Hardware
 
