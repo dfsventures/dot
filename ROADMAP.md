@@ -2,15 +2,13 @@
 
 ## Planned
 
-### Google Drive access
-
-Add `search_drive` and `read_drive_file` tools. Requires adding the Drive API scope to `auth_work.py`, deleting `token_work.pickle`, and re-running auth. Useful for documents, shared files, and anything that lives in Drive rather than Dropbox.
-
----
-
 ---
 
 ## Shipped
+
+### Google Drive access ✓ — 2026-07-07
+
+`search_drive` and `read_drive_file` tools mirror the Dropbox pair using the `drive.readonly` scope. Supports Google Docs, Sheets, and Slides (exported as text), plus PDF, DOCX, TXT, MD, and CSV files stored in Drive. Useful for documents and shared files that live in Drive rather than Dropbox.
 
 ### Follow-up reminders ✓ — 2026-06-11
 
