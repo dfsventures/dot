@@ -1139,7 +1139,16 @@ async def cmd_log(update, context):
 
 async def cmd_restart(update, context):
     if update.effective_user.id != YOUR_USER_ID: return
-    await update.message.reply_text("Restarting — back in ~10 seconds.")
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"], cwd=_BASE,
+            capture_output=True, text=True, timeout=30,
+        )
+        pull_output = (result.stdout + result.stderr).strip() or "Already up to date."
+    except Exception as e:
+        pull_output = f"git pull failed: {e}"
+    await update.message.reply_text(f"{pull_output}\n\nRestarting — back in ~10 seconds.")
     import sys
     sys.exit(0)
 

@@ -56,7 +56,9 @@ When `ingest.py` extracts facts from a document, it checks each fact against act
 
 ### Remote restart + reply context + briefing fixes ✓ — 2026-07-01
 
-**`/restart` command:** sends a confirmation message then calls `sys.exit(0)`; systemd's `Restart=always` brings the bot back up in ~10 seconds. No sudo, no terminal needed — deploy code changes from anywhere.
+**`/restart` command:** runs `git pull --ff-only` in the repo, replies with the pull result, then calls `sys.exit(0)`; systemd's `Restart=always` brings the bot back up in ~10 seconds. No sudo, no terminal needed — deploy code changes from anywhere.
+
+> **Correction (2026-07-21):** until this date, `/restart` only called `sys.exit(0)` — it never pulled from git, so it restarted whatever code was already on disk and did *not* deploy pushed commits. The `git pull --ff-only` step above was added to make the original claim true.
 
 **Telegram reply context:** when you use Telegram's reply feature on a message, the quoted text is prepended to your input so Dot knows what you're referencing without having to search back through the conversation.
 
