@@ -125,7 +125,7 @@ A `voice` message handler runs alongside the text handler. When a voice note arr
 
 ### Reminders
 
-Reminders are stored in a `reminders` table in `dot.db` with a note and a `due_at` timestamp in Toronto local time. A `JobQueue` job runs every 60 seconds, checks for any reminders whose `due_at` has passed, sends them as Telegram messages, and deletes them. Three tools — `set_reminder`, `list_reminders`, `delete_reminder` — let Claude set and manage them from natural language: "remind me to follow up with X in two weeks" resolves to a specific `YYYY-MM-DD HH:MM` timestamp and a confirmation.
+Reminders are stored in a `reminders` table in `dot.db` with a note and a `due_at` timestamp in Toronto local time. A `JobQueue` job runs every 60 seconds, checks for any reminders whose `due_at` has passed, sends them as Telegram messages, and deletes them. Due-times are stored and evaluated against `America/Toronto` explicitly (not the host's OS timezone), so the server can run anywhere without reminders drifting. Three tools — `set_reminder`, `list_reminders`, `delete_reminder` — let Claude set and manage them from natural language: "remind me to follow up with X in two weeks" resolves to a specific `YYYY-MM-DD HH:MM` timestamp and a confirmation.
 
 ### Morning briefing
 

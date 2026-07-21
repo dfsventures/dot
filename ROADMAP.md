@@ -44,9 +44,9 @@ JobQueue job runs every 5 minutes. When a calendar event with external attendees
 
 `/log <text>` accepts a pasted note or forwarded WhatsApp conversation. Claude extracts self-contained facts and saves them to memory. Fills the gap for communication that happens outside email.
 
-### Deal + memory auto-linking in ingest ✓ — 2026-06-24
+### Deal + memory auto-linking in ingest ✓ — 2026-06-24 (tag made real 2026-07-21, WS-9)
 
-When `ingest.py` extracts facts from a document, it checks each fact against active deal company names and tags matching memories with `deal:<company>`. Makes `get_deal_info` progressively richer as documents are ingested.
+When `ingest.py` extracts facts from a document, it checks each fact against active deal company names and tags matching memories with `deal:<company>`. `get_deal_info` now surfaces the 10 most recent ingested-document facts tagged for that company under a "From ingested documents" section, so deal lookups get progressively richer as documents are ingested — closing the gap flagged in the 2026-07-07 review (F-15).
 
 ### Named conversation sessions ✓ — 2026-06-26
 

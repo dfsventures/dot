@@ -436,14 +436,23 @@ def get_deal_info(company: str) -> str:
     deal = _get_deal(company)
     if not deal:
         return f"No deal found for '{company}'."
-    return "\n".join([
+    lines = [
         f"Company: {deal['company']}",
         f"Stage: {deal['stage']}",
         f"Last touchpoint: {deal['last_touchpoint'] or '—'}",
         f"Next action: {deal['next_action'] or '—'}",
         f"Notes: {deal['notes'] or '—'}",
         f"Created: {deal['created_at'][:10]} | Updated: {deal['updated_at'][:10]}",
-    ])
+    ]
+    from memory import conn as _mem_conn
+    rows = _mem_conn.execute(
+        "SELECT content FROM memories WHERE tags LIKE ? ORDER BY id DESC LIMIT 10",
+        (f"%deal:{deal['company']}%",),
+    ).fetchall()
+    if rows:
+        lines.append("\nFrom ingested documents:")
+        lines.extend(f"- {r[0]}" for r in rows)
+    return "\n".join(lines)
 
 def list_deals(stage: str = None) -> str:
     deals = _list_deals(stage)
@@ -689,11 +698,16 @@ SYSTEM_BLOCKS = [{
 }]
 
 def build_user_content(user_text: str) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/Toronto"))
+    parts = [f"<current_datetime>{now.strftime('%A, %B %-d, %Y %H:%M')} America/Toronto</current_datetime>"]
     memories = retrieve_relevant_memories(user_text, k=15)
-    if not memories:
-        return user_text
-    block = "\n".join(f"- {m}" for m in memories)
-    return f"<relevant_memories>\n{block}\n</relevant_memories>\n\n{user_text}"
+    if memories:
+        block = "\n".join(f"- {m}" for m in memories)
+        parts.append(f"<relevant_memories>\n{block}\n</relevant_memories>")
+    parts.append(user_text)
+    return "\n\n".join(parts)
 
 # ── CONVERSATION STATE ────────────────────────────────────────────────────────
 _BASE           = os.path.dirname(os.path.abspath(__file__))
@@ -819,7 +833,10 @@ def run_tool(name: str, tool_input: dict):
         return f"Tool error: {e}", True
 
 _whisper_model = None
-_prepped_events: set = set()
+_prepped_events: dict = {}   # event_id -> datetime added (successful sends only)
+_prepping_now:  set = set()  # event_ids currently being prepped (in-flight guard)
+_prep_notified: set = set()  # event_ids already sent a "couldn't prep" DM this window
+_meeting_prep_cal_notified = False  # avoids a DM every 5-min tick during a calendar outage
 _INTERNAL_DOMAINS = {'dfslab.net', 'dfs.vc'}
 _PREP_TOOL_NAMES  = {'search_gmail_work', 'read_gmail_work', 'search_granola', 'read_granola'}
 
@@ -1040,6 +1057,13 @@ async def cmd_sessions(update, context):
     await update.message.reply_text("Conversations:\n" + "\n".join(lines))
 
 # ── ERROR HANDLER ─────────────────────────────────────────────────────────────
+async def _notify_owner(context, text: str):
+    """Best-effort DM to Joey — must never raise (a failed notify can't crash the job)."""
+    try:
+        await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[:4000])
+    except Exception:
+        logging.exception("Failed to notify owner")
+
 async def error_handler(update, context):
     logging.error(f"Exception: {context.error}")
     if isinstance(update, Update) and update.effective_message:
@@ -1047,26 +1071,41 @@ async def error_handler(update, context):
             await update.effective_message.reply_text(f"⚠️ Error: {context.error}")
         except Exception:
             pass
+    else:
+        await _notify_owner(context, f"⚠️ Background job error: {context.error}")
 
 # ── MORNING BRIEFING (runs daily at BRIEFING_TIME) ────────────────────────────
 async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
-    from datetime import date
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     from memory import list_reminders as _lr
 
-    today_label = date.today().strftime("%A, %B %-d")
-    today_str   = date.today().strftime("%Y-%m-%d")
+    _today = datetime.now(ZoneInfo("America/Toronto")).date()
+    today_label = _today.strftime("%A, %B %-d")
+    today_str   = _today.strftime("%Y-%m-%d")
 
-    cal   = await asyncio.to_thread(list_calendar_events, 1, 10)
-    email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
-    due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
-    reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
-    stale = await asyncio.to_thread(get_stale_deals)
-    stale_str = "\n".join(
-        f"- {d['company']} ({d['stage']}) — last updated {d['updated_at'][:10]}, next action: {d['next_action'] or '—'}"
-        for d in stale
-    ) or "None"
+    fallback = "Briefing data unavailable."
 
-    prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
+    try:
+        cal   = await asyncio.to_thread(list_calendar_events, 1, 10)
+        email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
+        due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
+        reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
+        stale = await asyncio.to_thread(get_stale_deals)
+        stale_str = "\n".join(
+            f"- {d['company']} ({d['stage']}) — last updated {d['updated_at'][:10]}, next action: {d['next_action'] or '—'}"
+            for d in stale
+        ) or "None"
+
+        fallback = (
+            f"Morning briefing — {today_label} (raw data, formatting unavailable)\n\n"
+            f"CALENDAR (today):\n{cal}\n\n"
+            f"UNREAD EMAIL (last 24h):\n{email}\n\n"
+            f"REMINDERS DUE TODAY:\n{reminders_str}\n\n"
+            f"DEALS NEEDING ATTENTION:\n{stale_str}"
+        )
+
+        prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
 
 RAW DATA:
 
@@ -1090,10 +1129,9 @@ RULES (non-negotiable):
 5. News: search for African tech/fintech/AI/startup news published TODAY ({today_label}) only. If a story was published before today, do not include it — not even with a label like "from yesterday". If nothing was published today, write exactly: "Nothing notable today." Do not pad with older stories.
 6. Sections in order: Today, Email, Needs attention (if any), News. No greeting, no sign-off, no filler."""
 
-    briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
-    msgs = [{"role": "user", "content": prompt}]
+        briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
+        msgs = [{"role": "user", "content": prompt}]
 
-    try:
         def _briefing_call(cid=None):
             kw = dict(model="claude-sonnet-4-6", max_tokens=1500, tools=briefing_tools, messages=msgs)
             if cid:
@@ -1103,7 +1141,7 @@ RULES (non-negotiable):
         response = await asyncio.to_thread(_briefing_call)
         briefing_container_id = getattr(response, 'container_id', None)
         iterations = 0
-        while response.stop_reason in ("tool_use", "pause_turn") and iterations < 5:
+        while response.stop_reason in ("tool_use", "pause_turn") and iterations < 8:
             iterations += 1
             msgs.append({
                 "role": "assistant",
@@ -1122,11 +1160,15 @@ RULES (non-negotiable):
             response = await asyncio.to_thread(_briefing_call, briefing_container_id)
             briefing_container_id = getattr(response, 'container_id', None) or briefing_container_id
         text = " ".join(b.text for b in response.content if b.type == "text").strip()
-        if text:
-            for i in range(0, len(text), 4000):
-                await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[i:i+4000])
+        if not text:
+            text = fallback  # loop cap hit / no content — send raw data, not nothing
+        for i in range(0, len(text), 4000):
+            await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[i:i+4000])
     except Exception as e:
-        logging.error(f"Morning briefing error: {e}")
+        logging.exception("Morning briefing error")
+        await _notify_owner(context, f"⚠️ Briefing formatting failed ({e}). Raw briefing below.")
+        for i in range(0, len(fallback), 4000):
+            await context.bot.send_message(chat_id=YOUR_USER_ID, text=fallback[i:i+4000])
 
 # ── MEETING PREP BRIEF (runs every 5 min, fires ~30 min before external meetings) ─
 async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
@@ -1136,6 +1178,11 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
     window_start = now + timedelta(minutes=25)
     window_end   = now + timedelta(minutes=35)
 
+    cutoff = now - timedelta(hours=2)
+    for eid in [k for k, t in _prepped_events.items() if t < cutoff]:
+        del _prepped_events[eid]
+
+    global _meeting_prep_cal_notified
     try:
         cal_result = await asyncio.to_thread(
             lambda: calendar_work.events().list(
@@ -1147,13 +1194,17 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
             ).execute()
         )
         events = cal_result.get('items', [])
+        _meeting_prep_cal_notified = False
     except Exception as e:
         logging.error(f"Meeting prep calendar error: {e}")
+        if not _meeting_prep_cal_notified:
+            _meeting_prep_cal_notified = True
+            await _notify_owner(context, f"⚠️ Meeting prep couldn't read the calendar: {e}")
         return
 
     for event in events:
         event_id = event.get('id', '')
-        if event_id in _prepped_events:
+        if event_id in _prepped_events or event_id in _prepping_now:
             continue
 
         attendees = event.get('attendees', [])
@@ -1162,8 +1213,6 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
             if not a.get('self', False)
             and not any(a.get('email', '').lower().endswith(f'@{d}') for d in _INTERNAL_DOMAINS)
         ]
-
-        _prepped_events.add(event_id)
 
         if not external:
             continue
@@ -1191,6 +1240,7 @@ Specific and direct. Bullet points. No filler."""
         prep_tools = [t for t in TOOLS if t.get('name') in _PREP_TOOL_NAMES]
         msgs = [{"role": "user", "content": prompt}]
 
+        _prepping_now.add(event_id)
         try:
             def _prep_call(cid=None):
                 kw = dict(model="claude-sonnet-4-6", max_tokens=1000, tools=prep_tools, messages=msgs)
@@ -1223,18 +1273,34 @@ Specific and direct. Bullet points. No filler."""
             if text:
                 header = f"Prep — {title} (in ~30 min)\n\n"
                 await context.bot.send_message(chat_id=YOUR_USER_ID, text=(header + text)[:4000])
+                _prepped_events[event_id] = now
+                _prep_notified.discard(event_id)
         except Exception as e:
             logging.error(f"Meeting prep error for '{title}': {e}")
+            if event_id not in _prep_notified:
+                _prep_notified.add(event_id)
+                await _notify_owner(context, f"⚠️ Couldn't prep '{title}' — will retry.")
+        finally:
+            _prepping_now.discard(event_id)
 
 # ── REMINDER CHECKER (runs every 60s via JobQueue) ────────────────────────────
+_reminder_fail_counts: dict = {}  # reminder id -> consecutive failure count
+
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     due = get_due_reminders()
     for r in due:
         try:
             await context.bot.send_message(chat_id=YOUR_USER_ID, text=f"Reminder: {r['note']}")
             _delete_reminder(r['id'])
+            _reminder_fail_counts.pop(r['id'], None)
         except Exception as e:
             logging.error(f"Reminder delivery error: {e}")
+            # Throttle: only notify on the 3rd consecutive failure for the same
+            # reminder, so a stuck retry doesn't spam a DM every tick.
+            count = _reminder_fail_counts.get(r['id'], 0) + 1
+            _reminder_fail_counts[r['id']] = count
+            if count == 3:
+                await _notify_owner(context, f"⚠️ Reminder delivery failing repeatedly: {r['note']} ({e})")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def _post_init(app):

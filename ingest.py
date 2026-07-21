@@ -25,6 +25,19 @@ DROPBOX_TOKEN         = os.getenv("DROPBOX_TOKEN")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 DROPBOX_APP_KEY       = os.getenv("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET    = os.getenv("DROPBOX_APP_SECRET")
+TELEGRAM_TOKEN        = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID      = os.getenv("YOUR_TELEGRAM_USER_ID")
+
+def notify_owner(text: str):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10,
+        )
+    except Exception as e:
+        print(f"  Telegram notify failed: {e}")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 dbx    = dbx_lib.Dropbox(
@@ -439,6 +452,21 @@ def run():
 
     print(f"Found {len(to_process)} new file(s) to process.")
 
+    # Cap owner notifications per run so a bad batch can't spam Telegram —
+    # the first few failures get their own DM, the rest get folded into one
+    # summary line at the end.
+    fail_notify_count  = 0
+    fail_notify_cap    = 5
+    suppressed_failures = 0
+
+    def _notify_failure(msg: str):
+        nonlocal fail_notify_count, suppressed_failures
+        if fail_notify_count < fail_notify_cap:
+            notify_owner(msg)
+            fail_notify_count += 1
+        else:
+            suppressed_failures += 1
+
     for entry in to_process:
         print(f"\nProcessing: {entry.name}")
         ext = os.path.splitext(entry.name)[1].lower()
@@ -451,8 +479,18 @@ def run():
             # Route to structured ingestion for tabular files
             if ext in ('.xlsx', '.xls'):
                 fact_count = ingest_structured_xlsx(content, entry.name)
+                if fact_count == 0:
+                    print(f"  Structured ingestion produced 0 memories. Moving to Failed.")
+                    move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                    _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
+                    continue
             elif ext == '.csv':
                 fact_count = ingest_structured_csv(content, entry.name)
+                if fact_count == 0:
+                    print(f"  Structured ingestion produced 0 memories. Moving to Failed.")
+                    move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                    _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
+                    continue
             else:
                 # All other types: extract text then use Claude
                 text = extract_text(content, entry.name)
@@ -464,14 +502,21 @@ def run():
                     if not facts:
                         print(f"  No facts from native PDF read. Moving to Failed.")
                         move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                        _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
                         continue
                 elif not text or text.startswith('['):
                     print(f"  Could not extract text. Moving to Failed.")
                     move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                    _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
                     continue
                 else:
                     print(f"  Extracted {len(text):,} chars of text")
                     facts = extract_facts_with_claude(text, entry.name)
+                    if not facts:
+                        print(f"  No facts extracted from text. Moving to Failed.")
+                        move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                        _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
+                        continue
                 fact_count = len(facts)
                 tag = f"source:{entry.name}"
                 for fact in facts:
@@ -492,8 +537,12 @@ def run():
             print(f"  Error processing {entry.name}: {e}")
             try:
                 move_file(entry.path_display, FAILED_FOLDER, entry.name)
+                _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
             except Exception:
                 pass
+
+    if suppressed_failures:
+        notify_owner(f"⚠️ Dot Dump: {suppressed_failures} more file(s) failed and moved to Failed/ (see logs).")
 
     print("\nIngestion complete.")
 

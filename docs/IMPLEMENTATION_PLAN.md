@@ -17,12 +17,27 @@ Executor: Alvin. Do not commit as part of these workstreams — Joey handles com
 | F-8 | Low | `/memories`–`/forget` numbering relies on unstable `ORDER BY created_at DESC` ties (memory.py:89) | WS-6 |
 | F-9 | Low | Ingestion: duplicate facts on crash-retry; file stuck in inbox if move fails after `mark_ingested` (ingest.py:477-489); `_prepped_events` unbounded (agent.py:822) | WS-6 |
 | F-10 | Low | README briefing paragraph (line 132) omits stale-deals + news sections; voice replies lose reply context on non-text targets (agent.py:926) | WS-1 (docs part) |
+| F-11 | High | Background-job failures are invisible: `error_handler` (agent.py:1045) only replies when `isinstance(update, Update)`; JobQueue jobs pass `update=None`, so briefing/meeting-prep/reminder exceptions are log-only | WS-7 |
+| F-12 | High | Meeting prep marks an event prepped (`_prepped_events.add`, agent.py:1166) *before* the send; any transient Claude/Telegram failure permanently blacklists that meeting for the process lifetime — no retry | WS-8 |
+| F-13 | High | Ingestion plain-text path has no zero-facts guard (ingest.py:472-485); an empty/failed extraction moves the file to `Processed/` with zero facts and never reaches `Failed/`. Same gap in xlsx/csv small-sheet fallbacks | WS-9 |
+| F-14 | Medium | Briefing data-gathering runs outside the try (agent.py:1059-1067) over raw `conn.execute`; loop-cap-hit yields empty text → nothing sent (agent.py:1106,1124-1127); no retry/fallback | WS-7 |
+| F-15 | Low | `deal:<company>` tag (ingest.py:479) is never read; `get_deal_info` reads only the deals table. ROADMAP claim "progressively richer" was false — resolved by making it real (WS-9, D-5) | WS-9 |
+| F-16 | Low | No downtime catch-up for meeting prep: a restart/delayed tick during the 25-35 min window means the meeting is never prepped (reminders self-heal via `due_at <= now`; prep does not) | WS-8 (partial) |
+| F-17 | High | Main chat agent is never told the current date/time anywhere: `BASE_SYSTEM` (agent.py:669-689, frozen/cached) has none, and `build_user_content` (agent.py:700-705, the per-turn injection point, called on every message at agent.py:857) only added `<relevant_memories>`. Claude had to guess "today" from its own internal sense of time — for direct date questions, relative scheduling ("in two weeks"), and computing `set_reminder`'s `due_at` (schema at agent.py:601-606 names a format but never a reference date). Found 2026-07-21 investigating "Dot doesn't know today's date" | Fixed inline, 2026-07-21 (see below) |
+
+**F-17 fix (applied 2026-07-21, not a formal workstream — small, additive, same pattern as memories injection):** `build_user_content` now prepends `<current_datetime>{day}, {month} {date}, {year} {HH:MM} America/Toronto</current_datetime>` ahead of `<relevant_memories>`, computed fresh per turn via `datetime.now(ZoneInfo("America/Toronto"))` (inline import, matching codebase convention). Kept in the user turn rather than `BASE_SYSTEM` deliberately — the system block is cache-frozen for the whole session (see "Prompt caching that actually hits" in README.md), so a session spanning midnight would otherwise carry a stale date forever.
 
 ## Confirmed product decisions (Joey, 2026-07-07)
 
 - **D-1:** Code-level confirmation gate for calendar writes involving attendees (create with attendees, update adding attendees, delete of events that have attendees). Gmail drafts stay prompt-guarded only — drafts never send, so no gate.
 - **D-2:** Web viewer binds to the machine's Tailscale interface IP only (not `0.0.0.0`, not LAN).
 - **D-3:** Google Drive integration uses the `drive.readonly` scope, mirroring the read-only Dropbox pattern.
+
+## Confirmed product decisions (Joey, 2026-07-21)
+
+- **D-4:** Dot proactively DMs Joey when a background job fails or loses work: a briefing that crashes or produces no content, a meeting-prep brief that fails, or a Dot Dump file that lands in `Failed/`. Messages are terse and throttled (not one per tick on a stuck retry).
+- **D-5:** The `deal:<company>` tag ingest.py writes is made real, not dropped — `get_deal_info` is extended to surface ingested-document facts tagged for that company, delivering the "progressively richer" behavior the roadmap already (prematurely) claimed.
+- **D-6:** The full remaining backlog — WS-7, WS-8, WS-9 (new, reliability), plus the already-approved WS-4, WS-6, WS-2, WS-3, WS-5 — is in scope for this execution pass, not deferred.
 
 ## Conventions to follow (observed in the codebase)
 
@@ -209,7 +224,7 @@ Executor: Alvin. Do not commit as part of these workstreams — Joey handles com
 
 ---
 
-## WS-4 — Reminder timezone correctness (F-5)
+## WS-4 — Reminder timezone correctness (F-5) — ✅ Done, 2026-07-21
 
 **Goal:** Reminders fire at the intended Toronto time regardless of the server's OS timezone, matching how the briefing scheduler already works (agent.py:1268-1274). Must land before any VPS migration.
 
@@ -368,7 +383,7 @@ Executor: Alvin. Do not commit as part of these workstreams — Joey handles com
      ```
      and only save facts when `prior == 0`. Applies to the text/PDF path; pass an equivalent guard into `ingest_structured_xlsx`/`ingest_structured_csv` (same check at the top of each, returning 0 with a printed notice).
    - **Reorder move/mark**: currently save → `mark_ingested` → `move_file` (ingest.py:485-489). Change to save → `move_file` → `mark_ingested`. If the move fails, the file is *not* marked, so the next run retries it (and the dedupe guard above prevents duplicate facts). If the process dies after a successful move but before marking, the file is gone from the inbox so `already_ingested` is never consulted — harmless.
-7. `agent.py:822` — bound `_prepped_events`: store `{event_id: added_at_datetime}` instead of a set and, at the top of `check_meeting_prep`, drop entries older than 2 hours. Also flag (accepted, no fix): a `/restart` inside a meeting's 25-35-minute window can re-send one prep brief — harmless for a single user.
+7. ~~`agent.py:822` — bound `_prepped_events`...~~ **Superseded by WS-9's sibling WS-8 (2026-07-21) — do not apply this item.** WS-8 rewrites `_prepped_events` handling entirely (bounding it is a side effect of fixing the mark-before-send bug, F-12); applying this item separately would collide with WS-8's edit to the same lines.
 
 **Acceptance checklist**
 
@@ -384,6 +399,180 @@ Executor: Alvin. Do not commit as part of these workstreams — Joey handles com
 
 ---
 
+## WS-7 — Make background-job failures visible + briefing reliability (F-11, F-14)
+
+**Goal:** No background job (briefing, meeting prep, reminders) can fail silently again. Every exception surfaces to Joey on Telegram, and the morning briefing always sends *something* — a fallback of the raw data if Claude formatting fails or produces nothing.
+
+**Confirmed decisions:** D-4 (proactive failure notifications). Judgment call flagged: briefing tool-loop cap raised 5→8 to match meeting prep; reversal is one number.
+
+**Steps — all in `agent.py`**
+
+1. Add a shared owner-notify helper near the other job helpers (e.g. just above `error_handler`, ~line 1042). It must never raise (a failed notify can't crash the job):
+   ```python
+   async def _notify_owner(context, text: str):
+       try:
+           await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[:4000])
+       except Exception:
+           logging.exception("Failed to notify owner")
+   ```
+2. Upgrade `error_handler` (agent.py:1043-1049) so job-triggered errors (where `update` is not an `Update`) still reach Joey — this is the foundational F-11 fix and catches every job exception generically:
+   ```python
+   async def error_handler(update, context):
+       logging.error(f"Exception: {context.error}")
+       if isinstance(update, Update) and update.effective_message:
+           try:
+               await update.effective_message.reply_text(f"⚠️ Error: {context.error}")
+           except Exception:
+               pass
+       else:
+           await _notify_owner(context, f"⚠️ Background job error: {context.error}")
+   ```
+3. `send_morning_briefing` (agent.py:1052-1129) — move **all** data-gathering inside the try and add a fallback + explicit notify. Restructure so the raw sections are assembled first (they're cheap strings), the try wraps both gather and format, and any failure path still sends the raw briefing:
+   - Pull lines 1059-1067 (the `cal`/`email`/`due_today`/`stale` gathering and the `reminders_str`/`stale_str` assembly) **inside** the `try` at 1096.
+   - Build a plain-text fallback string from those raw sections (`today_label`, `cal`, `email`, `reminders_str`, `stale_str`) before the Claude call, so it's available in every failure branch. Initialize `fallback = "Briefing data unavailable."` before the try, in case data-gathering itself raises before the real fallback is built.
+   - After the tool loop, replace the `if text:` block (1125-1127) with:
+     ```python
+     if not text:
+         text = fallback  # loop cap hit / no content — send raw data, not nothing
+     for i in range(0, len(text), 4000):
+         await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[i:i+4000])
+     ```
+   - In the `except` (1128-1129), after logging, send the fallback and notify:
+     ```python
+     except Exception as e:
+         logging.exception("Morning briefing error")
+         await _notify_owner(context, f"⚠️ Briefing formatting failed ({e}). Raw briefing below.")
+         for i in range(0, len(fallback), 4000):
+             await context.bot.send_message(chat_id=YOUR_USER_ID, text=fallback[i:i+4000])
+     ```
+   - Raise the loop cap at line 1106 from `< 5` to `< 8`.
+4. Reminder + meeting-prep except blocks (agent.py:1226-1227, 1236-1237): these already `logging.error`; the upgraded `error_handler` does **not** catch them because they're caught locally. Leave the local catch (it preserves the loop) but add a `_notify_owner` call alongside the log so Joey learns of persistent failures. For reminders, to avoid per-tick spam on a stuck reminder, only notify when the same reminder id has failed before (a small module-level `_reminder_fail_counts` dict, notify on the 3rd consecutive failure). Flag this throttle as a judgment call.
+
+**Acceptance checklist**
+
+- [ ] Temporarily raise an exception inside `send_morning_briefing`'s data-gather (e.g. rename `get_stale_deals`); confirm Joey receives a `⚠️ Background job error` DM (via error_handler) or the fallback+notify, not silence.
+- [ ] Simulate empty model output (force `text=""`); confirm the raw fallback briefing is sent, not nothing.
+- [ ] A raised exception in `check_meeting_prep`'s calendar fetch produces a Telegram DM to Joey.
+- [ ] Normal briefing on a healthy day is unchanged (formatted, single message set).
+- [ ] `venv/bin/python -c "import agent"` imports clean.
+
+**UX impact:** additive — Joey now receives failure DMs and always gets a briefing (formatted normally, raw on failure). No change on healthy days.
+**Cost impact:** none (reuses existing Telegram sends; fallback path makes *fewer* API calls, not more).
+**Effort:** ~half a day including forced-failure testing via `/restart`.
+
+---
+
+## WS-8 — Meeting-prep mark-before-send fix + bounded dedupe (F-12, F-16; supersedes WS-6 6c item 7)
+
+**Goal:** A transient Claude/Telegram failure no longer permanently blacklists a meeting. An event is only recorded as prepped *after* a successful send; failures retry on the next 5-minute tick within the window. A slow-but-successful Claude call spanning two ticks does not double-send. `_prepped_events` is bounded so it can't grow unboundedly.
+
+**Confirmed decisions:** Reordering to mark-after-send is the core fix. Judgment call flagged: an in-flight guard prevents duplicate sends across overlapping/adjacent ticks without relying on APScheduler's `max_instances` behavior. Accepted limitation (unchanged from old plan): a `/restart` mid-window can re-send one brief — harmless for a single user.
+
+**Steps — all in `agent.py`**
+
+1. Replace the `_prepped_events: set` global (agent.py:822) with a bounded, timestamped structure plus an in-flight set:
+   ```python
+   _prepped_events: dict = {}   # event_id -> datetime added (successful sends only)
+   _prepping_now:  set = set()  # event_ids currently being prepped (in-flight guard)
+   ```
+2. At the top of `check_meeting_prep` (after computing `now`, ~1138), prune entries older than 2 hours so the dict can't grow without bound:
+   ```python
+   cutoff = now - timedelta(hours=2)
+   for eid in [k for k, t in _prepped_events.items() if t < cutoff]:
+       del _prepped_events[eid]
+   ```
+3. Rewrite the per-event guard and the `add` placement:
+   - Line 1156 becomes: `if event_id in _prepped_events or event_id in _prepping_now: continue`
+   - **Delete** the premature `_prepped_events.add(event_id)` at line 1166.
+   - Keep the `if not external: continue` (1168-1169) — a no-external event should just be skipped every tick; it never sends, so it must not be recorded as "prepped" (recording it is harmless but pointless; simplest is to leave it unrecorded).
+   - Immediately before the Claude call (before line 1194), mark in-flight: `_prepping_now.add(event_id)`.
+   - On successful send (inside the `if text:` at 1223-1225, after the send): `_prepped_events[event_id] = now`.
+   - In a `finally` for the prep try/except (1194-1227): `_prepping_now.discard(event_id)` — so a failed prep leaves the event un-prepped and eligible for retry next tick, while the in-flight guard is always cleared.
+   - In the `except` (1226-1227): keep the log, add `await _notify_owner(context, f"⚠️ Couldn't prep '{title}' — will retry.")` per D-4. To avoid per-tick spam across the 10-minute window, only notify once per event (track a `_prep_notified` set, or reuse a fail-count as in WS-7 step 4) — flag as judgment call.
+4. Interaction note for the executor: this **replaces** WS-6 section 6c item 7 entirely. Do not also apply that item.
+
+**Slow-call-spanning-two-ticks reasoning (for the reviewer):** with the in-flight guard, tick N adds `event_id` to `_prepping_now` before the (blocking, via `asyncio.to_thread`) Claude call. If tick N+1 fires while N is still awaiting, `event_id in _prepping_now` is true → skipped, no duplicate. On success N records it in `_prepped_events`; on failure the `finally` clears in-flight and N+1 (still in window) retries. This is correct regardless of whether PTB serializes the job.
+
+**Acceptance checklist**
+
+- [ ] Force `run_tool`/send to fail on the first tick for a windowed external meeting; confirm the event is NOT in `_prepped_events`, a retry-notice DM arrives once, and the next tick re-attempts and (on success) sends the brief.
+- [ ] On a successful prep, the event lands in `_prepped_events` and is not re-sent on subsequent ticks in the window.
+- [ ] `_prepped_events` entries older than 2h are pruned (unit-check with a back-dated timestamp).
+- [ ] A meeting with no external attendees is silently skipped every tick, no send, no error.
+
+**UX impact:** additive — meetings that previously got silently skipped now get prepped reliably; one retry-notice DM on transient failure (D-4). No change to successful preps.
+**Cost impact:** negligible — a failed prep may retry once or twice within the 10-minute window (2-3 extra Claude calls at most, only on failure days).
+**Effort:** ~half a day including forced-failure testing.
+
+---
+
+## WS-9 — Ingestion: no silent document loss + Failed/ notifications + deal-tag resolution (F-13, F-15)
+
+**Goal:** A document can never move to `Processed/` with zero facts saved — a zero-facts result routes to `Failed/` (mirroring the native-PDF path) so it's retryable and visible. Joey is DMed when a file lands in `Failed/`. The `deal:<company>` tag is made real per D-5.
+
+**Confirmed decisions:** D-4 (notify on `Failed/`). D-5 (make the deal link real — `get_deal_info` surfaces ingested-document facts).
+
+**Steps**
+
+1. `ingest.py` `run()` — close the plain-text zero-facts gap (F-13). After `facts = extract_facts_with_claude(text, entry.name)` (474) and before `fact_count = len(facts)` (475), add the same guard the native-PDF path already uses:
+   ```python
+   if not facts:
+       print(f"  No facts extracted from text. Moving to Failed.")
+       move_file(entry.path_display, FAILED_FOLDER, entry.name)
+       continue
+   ```
+2. `ingest.py` `run()` — close the xlsx/csv zero-facts gap. After the structured branch computes `fact_count` (452-455), before `mark_ingested` (485), add:
+   ```python
+   if fact_count == 0:
+       print(f"  Structured ingestion produced 0 memories. Moving to Failed.")
+       move_file(entry.path_display, FAILED_FOLDER, entry.name)
+       continue
+   ```
+   (This also covers a small-sheet Claude failure returning `[]`, since those flow up as `fact_count == 0`.)
+3. `ingest.py` — add a terse Telegram notifier (no new dependency; `requests` and `.dot.env` are already loaded). Near the config block (~line 40):
+   ```python
+   TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+   TELEGRAM_CHAT_ID = os.getenv("YOUR_TELEGRAM_USER_ID")
+
+   def notify_owner(text: str):
+       if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+           return
+       try:
+           requests.post(
+               f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+               json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10,
+           )
+       except Exception as e:
+           print(f"  Telegram notify failed: {e}")
+   ```
+   Call `notify_owner(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")` at each `Failed/` move in `run()` (the two new guards above, the existing native-PDF/no-text branches at 465-470, and the outer `except`'s move at 494). Cap notifications per run (e.g. the first 5 failures, then a summary line) so a bad batch can't spam — flag as judgment call.
+4. `agent.py` `get_deal_info` (435-446) — D-5: make the `deal:` tag real. After the existing deal block, append memories tagged for this company:
+   ```python
+   from memory import conn as _mem_conn
+   rows = _mem_conn.execute(
+       "SELECT content FROM memories WHERE tags LIKE ? ORDER BY id DESC LIMIT 10",
+       (f"%deal:{deal['company']}%",),
+   ).fetchall()
+   if rows:
+       lines.append("\nFrom ingested documents:")
+       lines.extend(f"- {r[0]}" for r in rows)
+   ```
+   Then update ROADMAP.md to remove the ⚠ correction added 2026-07-21 (the claim is now true) and note the ship date.
+
+**Acceptance checklist**
+
+- [ ] Drop a `.txt`/`.docx` that yields no extractable facts (or force `extract_facts_with_claude` to return `[]`); confirm the file lands in `Failed/`, `mark_ingested` did NOT run for it, and Joey gets a `Failed/` DM.
+- [ ] Same for a small xlsx/csv whose Claude pass returns nothing.
+- [ ] A healthy document still processes to `Processed/` with facts, no DM.
+- [ ] A file in `Failed/` is retried on the next cron run (not marked ingested) — verifies the fix composes with WS-6's move/mark reorder.
+- [ ] `get_deal_info("<company>")` surfaces ingested memories for a company with tagged facts; ROADMAP.md correction removed.
+
+**UX impact:** additive — documents that used to vanish now reliably reach `Failed/` for retry, and Joey is told. `get_deal_info` gets richer as ingestion happens, as originally promised.
+**Cost impact:** none — Telegram sends are free; no extra Claude calls (zero-facts files are moved, not re-processed within a run). WS-6's dedupe guard prevents retry from duplicating facts.
+**Effort:** ~half a day; deal-tag step adds ~1 hour and one manual re-check against a known company.
+
+---
+
 ## Execution order
 
-WS-1 → WS-2 → WS-3 → WS-4 → WS-5, then WS-6 when convenient. WS-1/3/4 are independent of each other; WS-2 should merge before WS-5 so the new Drive tools land on top of the gated `run_tool`. Each workstream is independently shippable; test on the production box via `/restart` after each.
+WS-7 → WS-8 → WS-9 first (2026-07-21 reliability pass — WS-7 is foundational since it's what makes every other job's failures visible; do not reorder). Then the remaining approved backlog: WS-4 → WS-6 (ingestion idempotency half only — 6c item 7 is superseded by WS-8, skip it) → WS-2 → WS-3 → WS-5. WS-2 should merge before WS-5 so the new Drive tools land on top of the gated `run_tool`. WS-1/3/4 are independent of each other. Each workstream is independently shippable; test on the production box via `/restart` after each.
