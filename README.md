@@ -271,7 +271,7 @@ sudo cp web.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable web && sudo systemctl start web
 ```
 
-Set `WEB_SECRET=<password>` in `.dot.env` before starting. Access the viewer at `http://<your-ip>:8080`. For remote access from anywhere, install [Tailscale](https://tailscale.com) on the server (`curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`) and on your other devices — no firewall changes needed.
+Set `WEB_SECRET=<password>` in `.dot.env` before starting. `web.service` binds only to the server's Tailscale interface (get it with `tailscale ip -4` and update the `--host` value in `web.service` if it ever changes) — it is not reachable from the LAN or the open internet, only from your other Tailscale-connected devices. Install [Tailscale](https://tailscale.com) on the server (`curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`) and on your other devices, then access the viewer at `http://<tailscale-ip>:8080`. Login issues a random per-process session cookie (not your password); restarting `web.service` invalidates it and you'll need to log in again.
 
 And schedule ingestion with cron:
 

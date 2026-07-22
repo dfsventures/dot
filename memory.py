@@ -86,7 +86,7 @@ def delete_memory(content: str) -> bool:
     return True
 
 def get_all_memories() -> list:
-    rows = conn.execute("SELECT content FROM memories ORDER BY created_at DESC").fetchall()
+    rows = conn.execute("SELECT content FROM memories ORDER BY id DESC").fetchall()
     return [r[0] for r in rows]
 
 def retrieve_relevant_memories(query: str, k: int = 15) -> list:

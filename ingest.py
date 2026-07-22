@@ -77,6 +77,13 @@ def mark_ingested(filename: str, path: str, memory_count: int):
     )
     conn.commit()
 
+def prior_fact_count(filename: str) -> int:
+    """Facts already saved for this filename's source tag — nonzero means a crash-retry, not a fresh file."""
+    tag_prefix = f"source:{filename}"
+    return conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE tags LIKE ?", (f"{tag_prefix}%",)
+    ).fetchone()[0]
+
 # ── TEXT EXTRACTION ───────────────────────────────────────────────────────────
 def extract_text(content: bytes, filename: str) -> str:
     name = filename.lower()
@@ -295,6 +302,12 @@ def ingest_structured_xlsx(content: bytes, filename: str) -> int:
     """Ingest a large XLSX row by row. Returns number of memories saved."""
     import openpyxl
     tag = f"source:{filename}"
+
+    prior = prior_fact_count(filename)
+    if prior:
+        print(f"  {prior} memories already exist for this file — skipping (crash retry)")
+        return prior
+
     total_saved = 0
 
     wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -350,6 +363,12 @@ def ingest_structured_csv(content: bytes, filename: str) -> int:
     """Ingest a large CSV row by row. Returns number of memories saved."""
     import csv as csv_lib
     tag = f"source:{filename}"
+
+    prior = prior_fact_count(filename)
+    if prior:
+        print(f"  {prior} memories already exist for this file — skipping (crash retry)")
+        return prior
+
     text = content.decode('utf-8', errors='ignore')
     reader = list(csv_lib.DictReader(text.splitlines()))
 
@@ -517,21 +536,25 @@ def run():
                         move_file(entry.path_display, FAILED_FOLDER, entry.name)
                         _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
                         continue
-                fact_count = len(facts)
-                tag = f"source:{entry.name}"
-                for fact in facts:
-                    deal_match = _find_deal_match(fact, active_deal_names)
-                    fact_tag = f"{tag},deal:{deal_match}" if deal_match else tag
-                    save_memory(fact, tags=fact_tag)
+                prior = prior_fact_count(entry.name)
+                if prior:
+                    print(f"  {prior} memories already exist for this file — skipping fact save (crash retry)")
+                    fact_count = prior
+                else:
+                    tag = f"source:{entry.name}"
+                    for fact in facts:
+                        deal_match = _find_deal_match(fact, active_deal_names)
+                        fact_tag = f"{tag},deal:{deal_match}" if deal_match else tag
+                        save_memory(fact, tags=fact_tag)
+                    fact_count = len(facts)
 
             print(f"  Total memories saved: {fact_count}")
 
-            # Mark as ingested in DB
-            mark_ingested(entry.name, entry.path_lower, fact_count)
-
-            # Move to Processed folder
+            # Move to Processed folder, then mark ingested — if the move fails, the file
+            # stays unmarked and is retried next run (prior_fact_count above dedupes the retry)
             move_file(entry.path_display, PROCESSED_FOLDER, entry.name)
             print(f"  Moved to {PROCESSED_FOLDER}")
+            mark_ingested(entry.name, entry.path_lower, fact_count)
 
         except Exception as e:
             print(f"  Error processing {entry.name}: {e}")

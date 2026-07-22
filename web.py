@@ -4,7 +4,7 @@ Secured by a Bearer token (WEB_SECRET in .dot.env).
 Access via Tailscale or SSH tunnel.
 """
 
-import json, os, glob
+import json, os, glob, secrets
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -19,6 +19,8 @@ BASE_DIR   = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "sessions"
 SESSION_JSON = BASE_DIR / "session.json"
 
+_SESSION_TOKEN = secrets.token_urlsafe(32)
+
 app = FastAPI(docs_url=None, redoc_url=None)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -26,12 +28,14 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 def _check_auth(request: Request):
     if not WEB_SECRET:
         raise HTTPException(500, "WEB_SECRET not set in .dot.env")
-    token = request.cookies.get("dot_token") or ""
-    if not token:
-        auth = request.headers.get("Authorization", "")
-        token = auth.removeprefix("Bearer ").strip()
-    if token != WEB_SECRET:
-        raise HTTPException(403, "Forbidden")
+    cookie_token = request.cookies.get("dot_token") or ""
+    if cookie_token and secrets.compare_digest(cookie_token, _SESSION_TOKEN):
+        return
+    auth = request.headers.get("Authorization", "")
+    bearer_token = auth.removeprefix("Bearer ").strip()
+    if bearer_token and secrets.compare_digest(bearer_token, WEB_SECRET):
+        return
+    raise HTTPException(403, "Forbidden")
 
 
 def _list_sessions() -> list[dict]:
@@ -118,15 +122,17 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def do_login(request: Request):
+    import asyncio
     from fastapi.responses import RedirectResponse
     form = await request.form()
     password = form.get("password", "")
-    if password != WEB_SECRET:
+    if not secrets.compare_digest(password, WEB_SECRET):
+        await asyncio.sleep(0.5)
         return templates.TemplateResponse("login.html", {
             "request": request, "error": "Wrong password"
         })
     response = RedirectResponse(url="/", status_code=303)
-    response.set_cookie("dot_token", WEB_SECRET, httponly=True, samesite="lax")
+    response.set_cookie("dot_token", _SESSION_TOKEN, httponly=True, samesite="lax")
     return response
 
 
