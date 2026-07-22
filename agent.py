@@ -347,7 +347,7 @@ def search_granola(query: str, max_results: int = 10):
         r = requests.get(
             "https://public-api.granola.ai/v1/notes",
             headers=headers,
-            params={"page_size": 60},
+            params={"page_size": 30},
             timeout=10
         )
         if r.status_code == 401:
