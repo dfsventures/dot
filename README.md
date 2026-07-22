@@ -224,7 +224,7 @@ venv/bin/python auth_work.py
 
 This saves `token_work.pickle`; the agent refreshes it automatically thereafter.
 
-> **If upgrading from an earlier version:** `auth_work.py` now includes `gmail.compose` scope for draft creation. Delete the existing `token_work.pickle` and re-run `auth_work.py` to pick up the new scope — the old token will cause a 403 when trying to create drafts.
+> **If upgrading from an earlier version:** any time a scope is added to `SCOPES` in `auth_work.py` (e.g. `gmail.compose` for draft creation, or `drive.readonly` for Drive search/read), the existing `token_work.pickle` does **not** pick it up automatically — tokens only carry the scopes consented to when they were issued. Delete the existing `token_work.pickle` and re-run `auth_work.py` to pick up any new scope; the old token will cause a 403 ("insufficient authentication scopes") on calls that need the new one. Also confirm the corresponding Google API (Gmail, Calendar, Drive) is enabled in Google Cloud Console for the project — an unenabled API 403s the same way, independent of OAuth scope.
 
 ### 4. Dropbox OAuth
 
