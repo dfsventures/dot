@@ -398,7 +398,7 @@ def read_granola(note_id: str):
         if attendees:
             names = ", ".join(a.get("name") or a.get("email", "") for a in attendees)
             output.append(f"Attendees: {names}")
-        start = (data.get("calendar_event") or {}).get("scheduled_start_time", "")[:10]
+        start = ((data.get("calendar_event") or {}).get("scheduled_start_time") or "")[:10]
         if start:
             output.append(f"Date: {start}")
         summary = data.get("summary_text") or data.get("summary_markdown") or ""
