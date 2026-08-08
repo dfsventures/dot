@@ -47,13 +47,21 @@ conn.executescript("""
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS procedures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trigger TEXT NOT NULL,
+        procedure TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_used_at TEXT
+    );
 """)
 conn.commit()
 
 # ── VECTOR STORE (ChromaDB + sentence-transformers) ───────────────────────────
-_embedder = SentenceTransformer('all-MiniLM-L6-v2')
-_chroma   = chromadb.PersistentClient(path=CHROMA_PATH)
-_col      = _chroma.get_or_create_collection("memories")
+_embedder  = SentenceTransformer('all-MiniLM-L6-v2')
+_chroma    = chromadb.PersistentClient(path=CHROMA_PATH)
+_col       = _chroma.get_or_create_collection("memories")
+_proc_col  = _chroma.get_or_create_collection("procedures")
 
 def _embed(text: str) -> list:
     return _embedder.encode(text).tolist()
@@ -104,28 +112,101 @@ def retrieve_relevant_memories(query: str, k: int = 15) -> list:
         print(f"ChromaDB query error: {e}")
         return get_all_memories()[:k]
 
+# ── PROCEDURAL MEMORY (how a past task was handled, separate from facts) ──────
+def save_procedure(trigger: str, procedure: str):
+    cur = conn.execute(
+        "INSERT INTO procedures (trigger, procedure) VALUES (?, ?)", (trigger, procedure)
+    )
+    conn.commit()
+    proc_id = str(cur.lastrowid)
+    try:
+        _proc_col.add(
+            ids=[proc_id],
+            embeddings=[_embed(trigger)],
+            documents=[procedure],
+            metadatas=[{"trigger": trigger}],
+        )
+    except Exception as e:
+        print(f"ChromaDB procedure write error: {e}")
+
+def get_all_procedures() -> list:
+    rows = conn.execute(
+        "SELECT id, trigger, procedure FROM procedures ORDER BY id DESC"
+    ).fetchall()
+    return [{"id": r[0], "trigger": r[1], "procedure": r[2]} for r in rows]
+
+def delete_procedure(procedure_id: int) -> bool:
+    row = conn.execute("SELECT id FROM procedures WHERE id = ?", (procedure_id,)).fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM procedures WHERE id = ?", (procedure_id,))
+    conn.commit()
+    try:
+        _proc_col.delete(ids=[str(procedure_id)])
+    except Exception as e:
+        print(f"ChromaDB procedure delete error: {e}")
+    return True
+
+def retrieve_relevant_procedures(query: str, k: int = 3) -> list:
+    """Vector similarity search against procedure triggers via ChromaDB.
+    Returns the procedure text (not the trigger). Falls back to recency if chroma is empty."""
+    try:
+        count = _proc_col.count()
+        if count == 0:
+            return [p["procedure"] for p in get_all_procedures()[:k]]
+        results = _proc_col.query(
+            query_embeddings=[_embed(query)],
+            n_results=min(k, count),
+        )
+        if results["ids"] and results["ids"][0]:
+            ids = results["ids"][0]
+            conn.execute(
+                f"UPDATE procedures SET last_used_at = datetime('now') "
+                f"WHERE id IN ({','.join('?' * len(ids))})",
+                [int(i) for i in ids],
+            )
+            conn.commit()
+        return results["documents"][0] if results["documents"] else []
+    except Exception as e:
+        print(f"ChromaDB procedure query error: {e}")
+        return [p["procedure"] for p in get_all_procedures()[:k]]
+
 def migrate_sqlite_to_chroma():
-    """Sync all existing SQLite memories into ChromaDB.
+    """Sync all existing SQLite memories (and procedures) into ChromaDB.
     Safe to run multiple times — skips IDs already in ChromaDB."""
     rows = conn.execute("SELECT id, content, tags FROM memories").fetchall()
-    if not rows:
-        return
     existing_ids = set(_col.get()["ids"])
     to_add = [(str(r[0]), r[1], r[2]) for r in rows if str(r[0]) not in existing_ids]
-    if not to_add:
-        return
-    print(f"Migrating {len(to_add)} memories to ChromaDB...")
-    batch = 500
-    for i in range(0, len(to_add), batch):
-        chunk = to_add[i:i+batch]
-        _col.add(
-            ids=[c[0] for c in chunk],
-            embeddings=[_embed(c[1]) for c in chunk],
-            documents=[c[1] for c in chunk],
-            metadatas=[{"tags": c[2]} for c in chunk]
-        )
-        print(f"  {min(i+batch, len(to_add))}/{len(to_add)}")
-    print("Migration complete.")
+    if to_add:
+        print(f"Migrating {len(to_add)} memories to ChromaDB...")
+        batch = 500
+        for i in range(0, len(to_add), batch):
+            chunk = to_add[i:i+batch]
+            _col.add(
+                ids=[c[0] for c in chunk],
+                embeddings=[_embed(c[1]) for c in chunk],
+                documents=[c[1] for c in chunk],
+                metadatas=[{"tags": c[2]} for c in chunk]
+            )
+            print(f"  {min(i+batch, len(to_add))}/{len(to_add)}")
+        print("Memory migration complete.")
+
+    proc_rows = conn.execute("SELECT id, trigger, procedure FROM procedures").fetchall()
+    existing_proc_ids = set(_proc_col.get()["ids"])
+    proc_to_add = [(str(r[0]), r[1], r[2]) for r in proc_rows if str(r[0]) not in existing_proc_ids]
+    if proc_to_add:
+        print(f"Migrating {len(proc_to_add)} procedures to ChromaDB...")
+        batch = 500
+        for i in range(0, len(proc_to_add), batch):
+            chunk = proc_to_add[i:i+batch]
+            _proc_col.add(
+                ids=[c[0] for c in chunk],
+                embeddings=[_embed(c[1]) for c in chunk],
+                documents=[c[2] for c in chunk],
+                metadatas=[{"trigger": c[1]} for c in chunk]
+            )
+            print(f"  {min(i+batch, len(proc_to_add))}/{len(proc_to_add)}")
+        print("Procedure migration complete.")
 
 # ── REMINDERS ─────────────────────────────────────────────────────────────────
 def set_reminder(note: str, due_at: str) -> dict:

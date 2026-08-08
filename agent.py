@@ -52,6 +52,8 @@ from memory import (
     list_reminders as _list_reminders,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
     get_stale_deals,
+    save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
+    retrieve_relevant_procedures,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -66,7 +68,7 @@ def extract_and_save_memories(conversation):
     ])
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=1000,
+            model="claude-sonnet-5", max_tokens=1000,
             system='Extract facts worth remembering. Return ONLY a JSON array of strings. If nothing, return []. Focus on people, companies, deals, preferences.',
             messages=[{"role": "user", "content": convo_text}]
         )
@@ -79,7 +81,7 @@ def extract_and_save_memories(conversation):
         print(f"Memory error: {e}")
 
 # ── CONTEXT WINDOW MANAGEMENT ─────────────────────────────────────────────────
-# Sonnet 4.6 has a 1M token context window — we manage at 80k tokens to keep
+# Sonnet 5 has a 1M token context window — we manage at 80k tokens to keep
 # costs reasonable and latency low for a chat agent use case.
 CONTEXT_TOKEN_LIMIT = 80_000
 
@@ -121,7 +123,7 @@ def compress_history(conversation: list) -> list:
     ])
     try:
         r = client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=600,
+            model="claude-sonnet-5", max_tokens=600,
             system="Summarise this conversation history concisely, preserving all key facts, decisions, and context that would be needed to continue the conversation intelligently. Be dense — this replaces the full history.",
             messages=[{"role": "user", "content": convo_text}]
         )
@@ -485,6 +487,10 @@ def search_memory(query: str) -> str:
         return "No memories found matching that query."
     return "\n".join(f"• {m}" for m in results)
 
+def save_procedure(trigger: str, procedure: str) -> str:
+    _save_procedure(trigger, procedure)
+    return f"Saved procedure for future '{trigger}' situations."
+
 def set_reminder(note: str, due_at: str) -> str:
     r = _set_reminder(note, due_at)
     return f"Reminder set: '{r['note']}' at {r['due_at']} (ID {r['id']})"
@@ -730,6 +736,14 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {
             "query": {"type": "string", "description": "What to search for"}
         }, "required": ["query"]}
+    },
+    {
+        "name": "save_procedure",
+        "description": "Save a reusable procedure to long-term memory — HOW you handled something, not a fact about WHAT is true. Call this when you work out a non-obvious multi-step approach that will likely recur (e.g. reconciling a Granola note with a mismatched calendar title, a specific sequence for updating a stale deal). Don't call this for one-off or trivial tasks.",
+        "input_schema": {"type": "object", "properties": {
+            "trigger":   {"type": "string", "description": "Short description of the situation this applies to, e.g. 'Granola note title doesn't match any calendar event'"},
+            "procedure": {"type": "string", "description": "The approach that worked, written so future-you can follow it directly"}
+        }, "required": ["trigger", "procedure"]}
     }
 ]
 
@@ -755,6 +769,7 @@ TOOL_FUNCTIONS = {
     "get_deal_info":        get_deal_info,
     "list_deals":           list_deals,
     "search_memory":        search_memory,
+    "save_procedure":       save_procedure,
 }
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -774,6 +789,7 @@ Your tools and what they contain:
 - set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something
+- save_procedure: save a reusable HOW-TO when you work out a non-obvious multi-step approach likely to recur — not for facts (those are captured automatically) and not for one-off tasks
 If Joey asks to be prepped for a meeting or asks for background on a person or company before a call, proactively search Granola, Gmail, Dropbox, and Drive for context and produce a tight prep brief without being asked to use specific tools.
 
 When a question involves a person or company, search Granola first (most recent call context),
@@ -783,6 +799,9 @@ Calendar changes that would notify attendees by email (creating an event with at
 A tool failing earlier in this conversation does not mean it is still broken — code changes and restarts happen between messages. Never tell Joey a tool or integration is "still down" or "still broken" based only on an earlier failure in the chat history; always call the tool again in the current turn and report what actually happens now.
 Facts retrieved from your long-term memory store appear inside <relevant_memories> tags
 at the top of user messages — treat them as background context about Joey and his work.
+Reusable procedures from past tasks appear inside <relevant_procedures> tags when relevant —
+these are HOW you solved something before, not facts; follow them unless the situation has
+clearly changed.
 Be direct and specific. No filler, no hedging.
 Never narrate your reasoning or process. Do not say 'Let me look that up', 'I'll check', 'Looking at your calendar', 'I'll search for', 'Now I have enough to...', or any similar meta-commentary. Work silently and present results directly.
 Keep responses concise and plain. Use bullet points for lists. No emoji headers, no heavy markdown structure, no formatted "report" layout. Write like a sharp colleague — not like an AI generating a document."""
@@ -805,6 +824,10 @@ def build_user_content(user_text: str) -> str:
     if memories:
         block = "\n".join(f"- {m}" for m in memories)
         parts.append(f"<relevant_memories>\n{block}\n</relevant_memories>")
+    procedures = retrieve_relevant_procedures(user_text, k=3)
+    if procedures:
+        block = "\n".join(f"- {p}" for p in procedures)
+        parts.append(f"<relevant_procedures>\n{block}\n</relevant_procedures>")
     parts.append(user_text)
     return "\n\n".join(parts)
 
@@ -899,7 +922,7 @@ def _with_cache_breakpoint(messages: list) -> list:
 
 def call_claude(container_id=None):
     kwargs = dict(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=4096,
         system=SYSTEM_BLOCKS,
         tools=TOOLS,
@@ -1100,6 +1123,26 @@ async def cmd_forget(update, context):
     except Exception:
         await update.message.reply_text("Usage: /forget [number from /memories]")
 
+async def cmd_procedures(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    procs = get_all_procedures()[:20]
+    if not procs:
+        await update.message.reply_text("No procedures saved yet.")
+        return
+    lines = [f"{i+1}. [{p['trigger']}] {p['procedure']}" for i, p in enumerate(procs)]
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+async def cmd_forget_procedure(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    procs = get_all_procedures()[:20]
+    try:
+        n = int(context.args[0]) - 1
+        target = procs[n]
+        await asyncio.to_thread(_delete_procedure, target["id"])
+        await update.message.reply_text(f"Deleted procedure: [{target['trigger']}] {target['procedure']}")
+    except Exception:
+        await update.message.reply_text("Usage: /forget_procedure [number from /procedures]")
+
 async def cmd_newsession(update, context):
     global conversation_history
     if update.effective_user.id != YOUR_USER_ID: return
@@ -1119,7 +1162,7 @@ async def cmd_log(update, context):
     try:
         resp = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=500,
             system='Extract facts worth remembering from this note or conversation. Return ONLY a JSON array of strings. Each fact must be self-contained. Focus on people, companies, deals, decisions, commitments. If nothing worth keeping, return [].',
             messages=[{"role": "user", "content": text}]
@@ -1310,7 +1353,7 @@ RULES (non-negotiable):
         msgs = [{"role": "user", "content": prompt}]
 
         def _briefing_call(cid=None):
-            kw = dict(model="claude-sonnet-4-6", max_tokens=1500, tools=briefing_tools, messages=msgs)
+            kw = dict(model="claude-sonnet-5", max_tokens=1500, tools=briefing_tools, messages=msgs)
             if cid:
                 kw["container_id"] = cid
             return client.messages.create(**kw)
@@ -1423,7 +1466,7 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
         _prepping_now.add(event_id)
         try:
             def _prep_call(cid=None):
-                kw = dict(model="claude-sonnet-4-6", max_tokens=1000, tools=prep_tools, messages=msgs)
+                kw = dict(model="claude-sonnet-5", max_tokens=1000, tools=prep_tools, messages=msgs)
                 if cid:
                     kw["container_id"] = cid
                 return client.messages.create(**kw)
@@ -1509,6 +1552,8 @@ def main():
     app.add_handler(CommandHandler("remember",   cmd_remember))
     app.add_handler(CommandHandler("memories",   cmd_memories))
     app.add_handler(CommandHandler("forget",     cmd_forget))
+    app.add_handler(CommandHandler("procedures",       cmd_procedures))
+    app.add_handler(CommandHandler("forget_procedure", cmd_forget_procedure))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(CommandHandler("log",        cmd_log))
     app.add_handler(CommandHandler("search",     cmd_search))

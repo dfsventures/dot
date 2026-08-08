@@ -47,6 +47,7 @@ Four modules:
 | `web_search` | Anthropic's native server-side web search |
 | `set_reminder` / `list_reminders` / `delete_reminder` | Time-based reminders delivered as Telegram messages |
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
+| `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
 
 Plus Telegram commands (type `/` to see the full menu in the chat):
@@ -59,6 +60,8 @@ Plus Telegram commands (type `/` to see the full menu in the chat):
 - `/remember <fact>` — save a memory manually
 - `/memories` — list recent memories
 - `/forget <n>` — delete a memory by number
+- `/procedures` — list saved procedures (HOW-TOs, distinct from fact memories)
+- `/forget_procedure <n>` — delete a procedure by number
 - `/newsession` — clear the current conversation (after auto-extracting facts worth keeping)
 - `/log <text>` — extract and save facts from a pasted note or WhatsApp conversation
 
@@ -162,7 +165,7 @@ Anything always-on works: an old desktop or laptop, an Intel NUC, a Raspberry Pi
 
 The design keeps recurring costs low on purpose: embeddings are computed locally (free), big spreadsheets are ingested without any model calls, and aggressive prompt caching means most input tokens bill at a tenth of the normal rate.
 
-**Claude API** (the only metered cost) — Dot uses Claude Sonnet 4.6 at $3/M input tokens, $15/M output, $3.75/M cache writes, and $0.30/M cache reads. Real numbers from one evening of active use (23 API calls — a normal back-and-forth session with tool use):
+**Claude API** (the only metered cost) — Dot uses Claude Sonnet 5 at $2/M input tokens (intro pricing through 2026-08-31, then $3/M), $10/M output ($15/M after intro), plus cache writes/reads at the usual ~1.25×/0.1× multiples of the input rate. The table below is real numbers from one evening of active use on the prior model (Sonnet 4.6, $3/$15 flat) — kept as a realistic shape for call volume and cache-hit ratio, not current pricing (23 API calls — a normal back-and-forth session with tool use):
 
 | Usage | Tokens | Cost |
 |---|---:|---:|

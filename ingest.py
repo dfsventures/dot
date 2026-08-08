@@ -238,7 +238,7 @@ def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> list:
     import base64
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=2000,
             system=EXTRACTION_SYSTEM,
             messages=[{
@@ -267,7 +267,7 @@ def extract_facts_with_claude(text: str, filename: str) -> list:
         return []
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=2000,
             system=EXTRACTION_SYSTEM,
             messages=[{
