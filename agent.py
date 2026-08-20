@@ -487,6 +487,19 @@ def save_procedure(trigger: str, procedure: str) -> str:
     _save_procedure(trigger, procedure)
     return f"Saved procedure for future '{trigger}' situations."
 
+_MIN_TEXT_CHARS = 200  # same threshold ingest.py uses to detect an image-only PDF
+
+def _pdf_text_or_marker(content: bytes, label: str) -> str:
+    """Extract a PDF's text layer, or return an explicit marker for image-only PDFs."""
+    import PyPDF2
+    reader = PyPDF2.PdfReader(io.BytesIO(content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    if len(text.strip()) < _MIN_TEXT_CHARS:
+        return (f"[{label}: {len(reader.pages)}-page PDF with no text layer (image-based deck). "
+                f"Nothing could be extracted locally. Check long-term memory for facts already "
+                f"ingested from this file before telling Joey anything about its contents.]")
+    return text
+
 def read_dropbox_file(file_path: str):
     try:
         metadata, response = dbx.files_download(file_path)
@@ -496,10 +509,7 @@ def read_dropbox_file(file_path: str):
             return content.decode('utf-8', errors='ignore')[:3000]
         elif name.endswith('.pdf'):
             try:
-                import PyPDF2
-                reader = PyPDF2.PdfReader(io.BytesIO(content))
-                text = " ".join(page.extract_text() or "" for page in reader.pages)
-                return text[:3000]
+                return _pdf_text_or_marker(content, metadata.name)[:3000]
             except Exception as e:
                 return f"[PDF read error: {e}]"
         elif name.endswith('.docx'):
@@ -547,9 +557,7 @@ def read_drive_file(file_id: str):
         if name.endswith(('.txt', '.md', '.csv')):
             return content.decode('utf-8', errors='ignore')[:3000]
         elif name.endswith('.pdf'):
-            import PyPDF2
-            reader = PyPDF2.PdfReader(io.BytesIO(content))
-            return " ".join(page.extract_text() or "" for page in reader.pages)[:3000]
+            return _pdf_text_or_marker(content, meta['name'])[:3000]
         elif name.endswith('.docx'):
             from docx import Document
             doc = Document(io.BytesIO(content))

@@ -49,6 +49,8 @@ Four modules:
 | `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
 
+Image-based PDFs (scanned or exported-as-images decks, no text layer) are readable through ingestion — drop them in Dropbox `/Dot Dump` and the ingest pipeline extracts facts via Claude — but `read_dropbox_file`/`read_drive_file` cannot re-read them live; they return an explicit "no text layer" marker instead of blank text. (Remove this note once WS-12/WS-13 land a cached transcription for live reads.)
+
 Plus Telegram commands (type `/` to see the full menu in the chat):
 
 - `/restart` — restart the bot remotely; systemd brings it back up in ~10 seconds
