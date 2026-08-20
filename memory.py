@@ -31,12 +31,6 @@ conn.executescript("""
         memory_count INTEGER DEFAULT 0,
         ingested_at TEXT DEFAULT (datetime('now'))
     );
-    CREATE TABLE IF NOT EXISTS reminders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        note TEXT NOT NULL,
-        due_at TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
-    );
     CREATE TABLE IF NOT EXISTS deals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         company TEXT NOT NULL UNIQUE,
@@ -207,32 +201,6 @@ def migrate_sqlite_to_chroma():
             )
             print(f"  {min(i+batch, len(proc_to_add))}/{len(proc_to_add)}")
         print("Procedure migration complete.")
-
-# ── REMINDERS ─────────────────────────────────────────────────────────────────
-def set_reminder(note: str, due_at: str) -> dict:
-    """due_at: 'YYYY-MM-DD HH:MM' in local (Toronto) time."""
-    cur = conn.execute("INSERT INTO reminders (note, due_at) VALUES (?, ?)", (note, due_at))
-    conn.commit()
-    return {"id": cur.lastrowid, "note": note, "due_at": due_at}
-
-def get_due_reminders() -> list:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("America/Toronto")).strftime('%Y-%m-%d %H:%M')
-    rows = conn.execute(
-        "SELECT id, note, due_at FROM reminders WHERE due_at <= ?", (now,)
-    ).fetchall()
-    return [{"id": r[0], "note": r[1], "due_at": r[2]} for r in rows]
-
-def delete_reminder(reminder_id: int):
-    conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
-    conn.commit()
-
-def list_reminders() -> list:
-    rows = conn.execute(
-        "SELECT id, note, due_at FROM reminders ORDER BY due_at ASC"
-    ).fetchall()
-    return [{"id": r[0], "note": r[1], "due_at": r[2]} for r in rows]
 
 # ── DEAL TRACKING ─────────────────────────────────────────────────────────────
 def get_deal(company: str) -> dict | None:

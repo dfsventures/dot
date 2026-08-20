@@ -18,7 +18,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 YOUR_USER_ID      = int(os.getenv("YOUR_TELEGRAM_USER_ID"))
 GRANOLA_TOKEN     = os.getenv("GRANOLA_TOKEN")
 DROPBOX_TOKEN     = os.getenv("DROPBOX_TOKEN")
-BRIEFING_TIME_STR = os.getenv("BRIEFING_TIME", "08:00")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -48,10 +47,7 @@ dbx = dbx_lib.Dropbox(
 from memory import (
     save_memory, delete_memory, get_all_memories,
     retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array,
-    set_reminder as _set_reminder, get_due_reminders, delete_reminder as _delete_reminder,
-    list_reminders as _list_reminders,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
-    get_stale_deals,
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures,
 )
@@ -491,20 +487,6 @@ def save_procedure(trigger: str, procedure: str) -> str:
     _save_procedure(trigger, procedure)
     return f"Saved procedure for future '{trigger}' situations."
 
-def set_reminder(note: str, due_at: str) -> str:
-    r = _set_reminder(note, due_at)
-    return f"Reminder set: '{r['note']}' at {r['due_at']} (ID {r['id']})"
-
-def list_reminders() -> str:
-    reminders = _list_reminders()
-    if not reminders:
-        return "No reminders set."
-    return "\n".join(f"ID {r['id']}: {r['note']} — due {r['due_at']}" for r in reminders)
-
-def delete_reminder(reminder_id: int) -> str:
-    _delete_reminder(reminder_id)
-    return f"Reminder {reminder_id} deleted."
-
 def read_dropbox_file(file_path: str):
     try:
         metadata, response = dbx.files_download(file_path)
@@ -686,26 +668,6 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}
     },
     {
-        "name": "set_reminder",
-        "description": "Set a reminder that fires as a Telegram message at the specified time. Use when Joey says 'remind me to...', 'follow up with X in N days', 'ping me about Y on [date]'. Always confirm the note text and time before setting.",
-        "input_schema": {"type": "object", "properties": {
-            "note":   {"type": "string", "description": "What to remind about — be specific, e.g. 'Follow up with Jane Doe re Series A deck'"},
-            "due_at": {"type": "string", "description": "When to fire, format: YYYY-MM-DD HH:MM (Toronto local time)"}
-        }, "required": ["note", "due_at"]}
-    },
-    {
-        "name": "list_reminders",
-        "description": "List all pending reminders with their IDs and due times.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "delete_reminder",
-        "description": "Delete a pending reminder by its ID (get IDs from list_reminders).",
-        "input_schema": {"type": "object", "properties": {
-            "reminder_id": {"type": "integer"}
-        }, "required": ["reminder_id"]}
-    },
-    {
         "name": "update_deal",
         "description": "Create or update a deal in the pipeline. Use for 'add company X', 'move X to due diligence', 'log that I spoke with X', 'set next action for X'. Stages: sourcing, first_call, due_diligence, passed, invested.",
         "input_schema": {"type": "object", "properties": {
@@ -762,9 +724,6 @@ TOOL_FUNCTIONS = {
     "read_dropbox_file":    read_dropbox_file,
     "search_drive":         search_drive,
     "read_drive_file":      read_drive_file,
-    "set_reminder":         set_reminder,
-    "list_reminders":       list_reminders,
-    "delete_reminder":      delete_reminder,
     "update_deal":          update_deal,
     "get_deal_info":        get_deal_info,
     "list_deals":           list_deals,
@@ -786,7 +745,6 @@ Your tools and what they contain:
 - search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
 - search_drive / read_drive_file: Joey's Google Drive (read-only)
 - web_search: Real-time web search
-- set_reminder / list_reminders / delete_reminder: time-based reminders delivered via Telegram
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something
 - save_procedure: save a reusable HOW-TO when you work out a non-obvious multi-step approach likely to recur — not for facts (those are captured automatically) and not for one-off tasks
@@ -1290,106 +1248,6 @@ async def error_handler(update, context):
     else:
         await _notify_owner(context, f"⚠️ Background job error: {context.error}")
 
-# ── MORNING BRIEFING (runs daily at BRIEFING_TIME) ────────────────────────────
-async def send_morning_briefing(context: ContextTypes.DEFAULT_TYPE):
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    from memory import list_reminders as _lr
-
-    _today = datetime.now(ZoneInfo("America/Toronto")).date()
-    today_label = _today.strftime("%A, %B %-d")
-    today_str   = _today.strftime("%Y-%m-%d")
-
-    fallback = "Briefing data unavailable."
-
-    try:
-        cal   = await asyncio.to_thread(list_calendar_events, 3, 15)
-        email = await asyncio.to_thread(search_gmail_work, "is:unread newer_than:1d", 5)
-        due_today = [r for r in _lr() if r["due_at"].startswith(today_str)]
-        reminders_str = "\n".join(f"- {r['note']} at {r['due_at'][11:]}" for r in due_today) or "None"
-        stale = await asyncio.to_thread(get_stale_deals)
-        stale_str = "\n".join(
-            f"- {d['company']} ({d['stage']}) — last updated {d['updated_at'][:10]}, next action: {d['next_action'] or '—'}"
-            for d in stale
-        ) or "None"
-
-        from memory import list_deals as _ld
-        pipeline_companies = [d['company'] for d in _ld('invested') + _ld('due_diligence')]
-        pipeline_str = ", ".join(pipeline_companies) if pipeline_companies else ""
-
-        fallback = (
-            f"Morning briefing — {today_label} (raw data, formatting unavailable)\n\n"
-            f"CALENDAR (next 3 days):\n{cal}\n\n"
-            f"UNREAD EMAIL (last 24h):\n{email}\n\n"
-            f"REMINDERS DUE TODAY:\n{reminders_str}\n\n"
-            f"DEALS NEEDING ATTENTION:\n{stale_str}"
-        )
-
-        prompt = f"""Today is {today_label}. Produce a clean morning briefing for Joey — an Africa-focused tech investor at DFS Lab.
-
-RAW DATA:
-
-CALENDAR (next 3 days):
-{cal}
-
-UNREAD EMAIL (last 24h):
-{email}
-
-REMINDERS DUE TODAY:
-{reminders_str}
-
-DEALS NEEDING ATTENTION (no update in 14+ days, active stages only):
-{stale_str}
-
-RULES (non-negotiable):
-1. Your response MUST start with the first section header. Not a single word before it.
-2. Calendar: 12-hour format, show date alongside time, event name, attendee first names only. No IDs. Skip all-day/personal blocks unless notable.
-3. Email: sender name, subject, received time. No IDs. Flag if it looks like it needs a reply.
-4. Deals: if stale deals exist, add a "Needs attention" section with how long since last update and pending next action. Omit entirely if none.
-5. News: search for African tech/fintech/AI/startup news published TODAY ({today_label}) only. If a story was published before today, do not include it — not even with a label like "from yesterday". If nothing was published today, write exactly: "Nothing notable today." Do not pad with older stories. {f'Also search specifically for any news today about these companies: {pipeline_str}.' if pipeline_str else ''}
-6. Sections in order: Today, Email, Needs attention (if any), News. No greeting, no sign-off, no filler."""
-
-        briefing_tools = [{"type": "web_search_20260209", "name": "web_search"}]
-        msgs = [{"role": "user", "content": prompt}]
-
-        def _briefing_call(cid=None):
-            kw = dict(model="claude-sonnet-5", max_tokens=1500, tools=briefing_tools, messages=msgs)
-            if cid:
-                kw["container_id"] = cid
-            return client.messages.create(**kw)
-
-        response = await asyncio.to_thread(_briefing_call)
-        briefing_container_id = getattr(response, 'container_id', None)
-        iterations = 0
-        while response.stop_reason in ("tool_use", "pause_turn") and iterations < 8:
-            iterations += 1
-            msgs.append({
-                "role": "assistant",
-                "content": [b.model_dump(exclude_none=True) for b in response.content],
-            })
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result, is_error = await asyncio.to_thread(run_tool, block.name, dict(block.input))
-                        tr = {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                        if is_error:
-                            tr["is_error"] = True
-                        tool_results.append(tr)
-                msgs.append({"role": "user", "content": tool_results})
-            response = await asyncio.to_thread(_briefing_call, briefing_container_id)
-            briefing_container_id = getattr(response, 'container_id', None) or briefing_container_id
-        text = " ".join(b.text for b in response.content if b.type == "text").strip()
-        if not text:
-            text = fallback  # loop cap hit / no content — send raw data, not nothing
-        for i in range(0, len(text), 4000):
-            await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[i:i+4000])
-    except Exception as e:
-        logging.exception("Morning briefing error")
-        await _notify_owner(context, f"⚠️ Briefing formatting failed ({e}). Raw briefing below.")
-        for i in range(0, len(fallback), 4000):
-            await context.bot.send_message(chat_id=YOUR_USER_ID, text=fallback[i:i+4000])
-
 # ── MEETING PREP BRIEF (runs every 5 min, fires ~30 min before external meetings) ─
 async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
@@ -1506,25 +1364,6 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
         finally:
             _prepping_now.discard(event_id)
 
-# ── REMINDER CHECKER (runs every 60s via JobQueue) ────────────────────────────
-_reminder_fail_counts: dict = {}  # reminder id -> consecutive failure count
-
-async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    due = get_due_reminders()
-    for r in due:
-        try:
-            await context.bot.send_message(chat_id=YOUR_USER_ID, text=f"Reminder: {r['note']}")
-            _delete_reminder(r['id'])
-            _reminder_fail_counts.pop(r['id'], None)
-        except Exception as e:
-            logging.error(f"Reminder delivery error: {e}")
-            # Throttle: only notify on the 3rd consecutive failure for the same
-            # reminder, so a stuck retry doesn't spam a DM every tick.
-            count = _reminder_fail_counts.get(r['id'], 0) + 1
-            _reminder_fail_counts[r['id']] = count
-            if count == 3:
-                await _notify_owner(context, f"⚠️ Reminder delivery failing repeatedly: {r['note']} ({e})")
-
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def _post_init(app):
     from telegram import BotCommand
@@ -1560,15 +1399,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(error_handler)
-    app.job_queue.run_repeating(check_reminders,    interval=60,  first=10)
     app.job_queue.run_repeating(check_meeting_prep, interval=300, first=60)
-    from zoneinfo import ZoneInfo
-    import datetime as _dt
-    _h, _m = map(int, BRIEFING_TIME_STR.split(":"))
-    app.job_queue.run_daily(
-        send_morning_briefing,
-        time=_dt.time(_h, _m, tzinfo=ZoneInfo("America/Toronto"))
-    )
     print("Dot is running — Granola, Dropbox, Gmail, Calendar (work)...")
     app.run_polling()
 

@@ -45,7 +45,6 @@ Four modules:
 | `search_dropbox` / `read_dropbox_file` | Find and read Dropbox files (PDF, DOCX, TXT, MD) |
 | `search_drive` / `read_drive_file` | Find and read Google Drive files (Google Docs/Sheets/Slides exported as text, plus PDF, DOCX, TXT, MD, CSV) — read-only |
 | `web_search` | Anthropic's native server-side web search |
-| `set_reminder` / `list_reminders` / `delete_reminder` | Time-based reminders delivered as Telegram messages |
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
 | `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
@@ -129,14 +128,6 @@ A `voice` message handler runs alongside the text handler. When a voice note arr
 
 **Prerequisite:** `sudo apt install ffmpeg` — Whisper needs it to decode audio. The first voice message also downloads the Whisper model weights (~75 MB) to `~/.cache/whisper`; subsequent loads are instant.
 
-### Reminders
-
-Reminders are stored in a `reminders` table in `dot.db` with a note and a `due_at` timestamp in Toronto local time. A `JobQueue` job runs every 60 seconds, checks for any reminders whose `due_at` has passed, sends them as Telegram messages, and deletes them. Three tools — `set_reminder`, `list_reminders`, `delete_reminder` — let Claude set and manage them from natural language: "remind me to follow up with X in two weeks" resolves to a specific `YYYY-MM-DD HH:MM` timestamp and a confirmation. Due-times are stored and evaluated in Toronto time (`America/Toronto`) explicitly — the host OS timezone does not affect when reminders fire.
-
-### Morning briefing
-
-Every morning at a configurable time (default `08:00` Toronto; set `BRIEFING_TIME=HH:MM` in `.dot.env`), Dot sends an unprompted Telegram message with today's calendar events, unread emails from the last 24 hours, reminders due that day, stale-deal alerts (active deals untouched for 14+ days), and today's news headlines via web search. It calls the existing tool functions directly — no extra API call — and runs via PTB's `job_queue.run_daily`, so no extra cron entry is needed.
-
 ### Deal tracking
 
 A `deals` table in `dot.db` holds a lightweight CRM: company name (unique), pipeline stage, last touchpoint, next action, and notes. Stages follow a fixed vocabulary: `sourcing`, `first_call`, `due_diligence`, `passed`, `invested`. Three tools — `update_deal`, `get_deal_info`, `list_deals` — make the pipeline queryable in natural language: "add Acme to the pipeline", "move Acme to due diligence, next action is send term sheet by June 20", "what's in due diligence right now?". `update_deal` is an upsert — it creates the deal if it doesn't exist and only updates the fields you specify if it does.
@@ -214,7 +205,6 @@ cp .env.example .dot.env
 - **Telegram**: create a bot with [@BotFather](https://t.me/BotFather) → `TELEGRAM_TOKEN`. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot) → `YOUR_TELEGRAM_USER_ID`.
 - **Anthropic**: API key from [console.anthropic.com](https://console.anthropic.com).
 - **Granola**: API token (the public API requires an Enterprise plan).
-- **Briefing time**: `BRIEFING_TIME=08:00` sets when the morning briefing fires (Toronto local time). Omit to use the default.
 
 ### 3. Google OAuth
 
