@@ -585,3 +585,459 @@ Executor: Alvin. Do not commit as part of these workstreams — Joey handles com
 ## Execution order
 
 WS-7 → WS-8 → WS-9 first (2026-07-21 reliability pass — WS-7 is foundational since it's what makes every other job's failures visible; do not reorder). Then the remaining approved backlog: WS-4 → WS-6 (ingestion idempotency half only — 6c item 7 is superseded by WS-8, skip it) → WS-2 → WS-3 → WS-5. WS-2 should merge before WS-5 so the new Drive tools land on top of the gated `run_tool`. WS-1/3/4 are independent of each other. Each workstream is independently shippable; test on the production box via `/restart` after each.
+
+---
+
+# 2026-08-20 review — document read cache + verbatim deck reads (pre-implementation)
+
+Scope of the review: the proposed `doc_cache` feature (cache ingest-time parsed text; have
+`read_dropbox_file` / `read_drive_file` read from it) and the open question about image-only PDFs.
+Every claim below was checked against the source, and against live Dropbox metadata and `dot.db`
+on the production box (read-only probes).
+
+## Findings register (2026-08-20 review)
+
+**F-21 (blocking design flaw in the proposal as written):** keying the cache on the Dropbox path
+that `ingest.py` sees would produce a cache that can *never* hit. `run()` moves the file to
+`Processed/` (ingest.py:555) *before* recording it, and `mark_ingested` stores `entry.path_lower`
+— the pre-move inbox path (ingest.py:73-78, 557). Confirmed in `dot.db`: `ingested_files` rows read
+`/dot dump/pagrin.pdf`, while `files_search_v2` — the source of the `file_path` argument
+`read_dropbox_file` is called with, via `search_dropbox` printing `meta.path_display`
+(agent.py:435) — returns `/Dot Dump/Processed/pagrin.pdf`. Two further path hazards: `move_file`
+passes `autorename=True` (ingest.py:413), so a name collision silently renames the file; and
+`path_lower` vs `path_display` differ in case. **Fix:** key on the Dropbox file `id`, which is
+stable across moves and renames (verified: `pagrin.pdf` is `id:xpA2TiOZ9_gAAAAAAAFjKw` in
+`Processed/`, and `files_get_metadata` accepts an id *or* a path). Use `content_hash` — not `rev`
+— as the version column: it is derived from bytes, so a move or rename provably cannot invalidate
+it. Both fields are on every `FileMetadata` (dropbox SDK 12.0.2; `rev`, `content_hash`, `id` all
+present), so `list_inbox()` already has everything ingest needs.
+
+**F-22 (real bug, independent of caching):** the live re-read of an image-only PDF does not return
+"garbage" — it returns *whitespace with no error marker*. `read_dropbox_file` (agent.py:501-502)
+does `" ".join(page.extract_text() or "" for page in reader.pages)[:3000]`, so a 19-page image deck
+returns 18 space characters. There is no `[...]` marker, so Claude receives an apparently-successful
+empty tool result and will either invent content or tell Joey the file is empty. `read_drive_file`
+has the identical bug (agent.py:552). Measured incidence on the 15 most recently ingested decks:
+4 of 15 (27%) have a zero-length text layer — CreativAI, Bloccpay, Clusterlab, Lukhu.
+
+**F-23 (premise correction):** "ingest.py parses each new file once via `extract_text()`" is true
+only for `.pdf/.docx/.pptx/.txt/.md`. `.xlsx/.xls/.csv` never call `extract_text` — they branch to
+`ingest_structured_xlsx` / `ingest_structured_csv` (ingest.py:499-512), and the large-file path
+never materialises a single text blob at all (it iterates rows straight into memories,
+ingest.py:348-358). So a "write the cache right after `extract_text()`" hook covers neither format.
+Related: `read_dropbox_file` cannot read `.pptx/.xlsx/.csv` today at all — it falls through to
+`[File type not readable as text: ...]` (agent.py:509-510). A cache-first read is therefore an
+*upgrade path* for `.pptx` (ingest can already parse it) at no extra cost; xlsx/csv need a separate
+decision and are excluded below.
+
+**F-24 (truncation mismatch is larger than assumed):** `extract_text` caps every format at 15,000
+chars (ingest.py:100, 108, 130, 149, 159, 164); the read tools cap at 3,000 on return
+(agent.py:496, 502, 508, 545, 548, 552, 556). Measured on real ingested files: the 2025 Africa VC
+Exit report has 250,204 chars of text layer (ingest saw 6% of it; a live read shows 1.2%), and
+`2026_HustleSasa_BusinessOverview.pdf` has 57,099. Consequences: (a) the cache must store the
+*full* parse, not the 15,000-truncated ingest value, or the ingest cap gets baked into every future
+read; (b) caching alone does not make a long document readable — the 3,000-char return cap is the
+binding limit and needs its own decision (D-8).
+
+**F-25 (Drive is a much weaker case than Dropbox):** `ingest.py` only ever watches Dropbox
+(`INBOX_FOLDER = "/Dot Dump"`, ingest.py:51) — no Drive file is ever ingested. A `doc_cache` for
+Drive can therefore only be populated by a live parse that already succeeded, so its benefit is
+latency/bandwidth only and it does nothing for the image-PDF problem. It is still worth doing
+because it is nearly free: `read_drive_file` already calls `files().get(...)` (agent.py:541), so
+adding `version, modifiedTime` to the `fields` string costs zero extra API calls. Dropbox, by
+contrast, pays a real added call — measured `files_get_metadata` latency 0.18-0.31s per read.
+(Use `version` for the revision column, not `md5Checksum`: native Docs/Sheets/Slides have no
+checksum.)
+
+**F-26 (decides the open question):** "cache the facts bullets as a lossy stand-in" is, in effect,
+already shipped. Ingested facts are tagged `source:<filename>` (ingest.py:544) and are reachable two
+ways at conversation time — passive per-turn injection via `retrieve_relevant_memories`, and the
+`search_memory` tool (agent.py:480-484, schema at :696, registered at :730). Option (a) would
+therefore store a second copy of data the agent can already retrieve, while introducing a new
+failure mode: distilled bullets delivered in a slot the model reads as "the document's contents",
+which invites Claude to present a summary as if it were verbatim source. Recommendation: **option
+(b)**, with the ordering safeguard in F-27.
+
+**F-27 (risk in option (b) as proposed):** asking one Claude call for facts *and* a full
+transcription at `max_tokens` 6000-8000 creates a silent-document-loss path of exactly the kind
+WS-9 was written to close. If the response is cut at `max_tokens` mid-transcription, the JSON no
+longer parses, `parse_json_array` returns `[]` (memory.py:288-299), and ingest.py:521-525 moves the
+deck to `Failed/`, losing the facts too. Mitigation is cheap: require facts first, then a
+`===TRANSCRIPT===` delimiter, and parse the facts out of the prefix — truncation then costs only
+the transcript tail. Do not modify the shared `parse_json_array`; split in `ingest.py` before
+calling it.
+
+## Product decisions (Joey, 2026-08-20) — all three confirmed per Felix's recommendation
+
+- **D-7 → (b), full transcription at ingest. Confirmed.**
+- **D-8 → (iii), `offset` paging argument on `read_dropbox_file`/`read_drive_file`. Confirmed.**
+- **D-9 → yes, gated live vision fallback, shipped last (WS-13). Confirmed.**
+
+Rationale for each retained below as written during review.
+
+- **D-7 (the open question) — recommend option (b), full transcription at ingest.** Rationale in
+  F-26. Cost: transcription output is roughly 4,000-6,000 output tokens for a 16-page deck ≈
+  $0.04-0.06 at $10/M, on top of the current $0.10-0.20 per image deck — i.e. ~25-30% more for the
+  ~27% of decks that are image-only. At the observed intake rate (206 documents since ~mid-June ≈
+  80/month, ~22 of them image-only) that is **~$1/month**, inside the existing Anthropic line, no
+  new cost line. In exchange, every later re-read of that deck is free and instant. Option (a) is
+  cheaper by that ~$1/month and buys nothing that `search_memory` does not already provide.
+- **D-8 — the 3,000-char return cap (F-24).** Caching does not change what Joey sees; the cap does.
+  Options: **(i)** leave 3,000 as-is (cache is a latency/robustness win only); **(ii)** raise the cap
+  for cache hits only, to ~12,000 chars (~3k tokens, which then sits in conversation history and is
+  re-read at the 0.1× cache rate every subsequent turn); **(iii)** add an optional `offset` argument
+  to `read_dropbox_file` / `read_drive_file` so Claude can page through a long document on demand,
+  keeping the default page at 3,000. **Recommendation: (iii)**, with (ii) at 8,000 as a simpler
+  fallback if you would rather not touch the tool schema. (iii) keeps the common case cheap and
+  makes long reports genuinely readable; it is the only option that helps the 250k-char report.
+- **D-9 — live vision fallback for image PDFs that were never ingested (WS-13).** Most of Joey's
+  Dropbox never passed through `/Dot Dump`, so the cache cannot help those files. Sending the PDF to
+  Claude natively from inside the tool would fix them, at $0.10-0.20 and 20-60s of added latency on
+  that conversational turn, cached thereafter. **Recommendation: yes, but ship it last and gate it**
+  — only when the local parse yields <200 chars, only under the existing size/page caps, and with
+  the result cached so the cost is paid once per file. Say no if you would rather image decks always
+  go through `/Dot Dump`.
+
+---
+
+## WS-10 — Stop returning blank text for image-only PDFs (F-22)
+
+**Goal:** a live read of a PDF with no text layer returns an explicit, honest marker instead of a
+string of spaces, so Claude never treats an empty extraction as a successful read. Independent of
+the cache work and worth shipping on its own.
+
+**Confirmed decisions:** none needed.
+
+**Steps — all in `agent.py`**
+
+1. Add a small shared guard near the read tools (above `read_dropbox_file`, agent.py:490), matching
+   the existing "errors are strings, never raise" convention:
+   ```python
+   _MIN_TEXT_CHARS = 200  # same threshold ingest.py uses to detect an image-only PDF
+
+   def _pdf_text_or_marker(content: bytes, label: str) -> str:
+       """Extract a PDF's text layer, or return an explicit marker for image-only PDFs."""
+       import PyPDF2
+       reader = PyPDF2.PdfReader(io.BytesIO(content))
+       text = "\n".join(page.extract_text() or "" for page in reader.pages)
+       if len(text.strip()) < _MIN_TEXT_CHARS:
+           return (f"[{label}: {len(reader.pages)}-page PDF with no text layer (image-based deck). "
+                   f"Nothing could be extracted locally. Check long-term memory for facts already "
+                   f"ingested from this file before telling Joey anything about its contents.]")
+       return text
+   ```
+   Note the join changes from `" "` to `"\n"`, matching `extract_text` in ingest.py:100 — page
+   boundaries currently collapse into a single space in the agent's copy.
+2. `read_dropbox_file` (agent.py:497-504) — replace the inline PyPDF2 block with
+   `return _pdf_text_or_marker(content, metadata.name)[:3000]`, keeping the existing
+   `except Exception as e: return f"[PDF read error: {e}]"` wrapper.
+3. `read_drive_file` (agent.py:549-552) — same substitution using `meta['name']`.
+4. `README.md` — under "What the agent can do", note that image-based PDFs are readable via
+   ingestion (Dropbox `/Dot Dump`) but not via a live re-read, until WS-12/WS-13 land. Remove this
+   line when they do.
+
+**Acceptance checklist**
+
+- [ ] `read_dropbox_file("/Dot Dump/Processed/Bloccpay_June_2026.pdf")` returns the `[...no text
+      layer...]` marker, not whitespace (this file measured 0 extractable chars).
+- [ ] `read_dropbox_file("/Dot Dump/Processed/pagrin.pdf")` still returns real text (3,025 chars
+      measured, so the 200-char threshold is not near the boundary).
+- [ ] A text-layer PDF's output now has newlines between pages, not spaces.
+- [ ] `read_drive_file` on a scanned PDF in Drive behaves the same way.
+
+**UX impact:** strictly additive — a case that silently produced nothing now says so. No change to
+any read that works today.
+**Cost impact:** none.
+**Effort:** ~1 hour.
+
+---
+
+## WS-11 — `doc_cache`: identity-keyed parsed-document cache (F-21, F-23, F-24, F-25)
+
+**Goal:** a document parsed once is never re-parsed while its bytes are unchanged; `read_dropbox_file`
+answers from `dot.db` when the cached copy still matches the live file, and backfills the cache on
+any miss. Ingest populates it for free as a side effect of work it already does.
+
+**Confirmed decisions:** D-8 (needed before implementing step 5 — the rest of the workstream is
+decision-independent).
+
+**Design:** the key is `(source, file_key)` where `file_key` is the Dropbox file `id` or the Drive
+`fileId` — both stable across moves and renames (F-21). The freshness column is `revision`:
+`content_hash` for Dropbox, `version` for Drive. A revision mismatch is treated as a plain miss —
+re-parse and overwrite — so the worst case of any staleness bug is a wasted parse, never a wrong
+answer.
+
+**Steps**
+
+1. `memory.py` — extend the existing `conn.executescript(...)` block (memory.py:18-51) with an
+   additive table. No existing table or column is touched:
+   ```sql
+   CREATE TABLE IF NOT EXISTS doc_cache (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       source TEXT NOT NULL,              -- 'dropbox' | 'drive'
+       file_key TEXT NOT NULL,            -- Dropbox file id / Drive fileId — stable across moves
+       revision TEXT NOT NULL DEFAULT '', -- Dropbox content_hash / Drive version
+       filename TEXT DEFAULT '',
+       kind TEXT DEFAULT 'text',          -- 'text' (local parse) | 'vision' (Claude transcription)
+       content TEXT NOT NULL,
+       char_count INTEGER DEFAULT 0,
+       created_at TEXT DEFAULT (datetime('now')),
+       updated_at TEXT DEFAULT (datetime('now')),
+       last_read_at TEXT,
+       UNIQUE (source, file_key)
+   );
+   ```
+   `last_read_at` exists so an eviction policy can be added later without a migration; do not write
+   one now (sizing in the cost statement below).
+2. `memory.py` — add the two accessors below `save_memory` (memory.py:63-75), same style, never
+   raising into callers:
+   ```python
+   def get_cached_doc(source: str, file_key: str, revision: str) -> str | None:
+       """Cached parse for this exact file revision, or None. A revision mismatch is a miss."""
+       row = conn.execute(
+           "SELECT content FROM doc_cache WHERE source = ? AND file_key = ? AND revision = ?",
+           (source, file_key, revision),
+       ).fetchone()
+       if not row:
+           return None
+       conn.execute(
+           "UPDATE doc_cache SET last_read_at = datetime('now') WHERE source = ? AND file_key = ?",
+           (source, file_key),
+       )
+       conn.commit()
+       return row[0]
+
+   def save_cached_doc(source: str, file_key: str, revision: str, filename: str,
+                       content: str, kind: str = "text"):
+       if not content or content.startswith("["):
+           return  # never cache an error marker or an empty parse
+       try:
+           conn.execute(
+               "INSERT INTO doc_cache (source, file_key, revision, filename, kind, content, char_count) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?) "
+               "ON CONFLICT(source, file_key) DO UPDATE SET "
+               "revision=excluded.revision, filename=excluded.filename, kind=excluded.kind, "
+               "content=excluded.content, char_count=excluded.char_count, updated_at=datetime('now')",
+               (source, file_key, revision, filename, kind, content, len(content)),
+           )
+           conn.commit()
+       except Exception as e:
+           print(f"doc_cache write error: {e}")
+   ```
+   (SQLite 3.46.1 on the box — UPSERT is supported.)
+3. `ingest.py` — populate on the text path only (F-23: the xlsx/csv branches have no single text
+   blob and `read_dropbox_file` cannot read those types anyway). Import alongside the existing
+   memory import (ingest.py:56), then in `run()` after the successful-extraction branch prints
+   `Extracted {len(text):,} chars` (ingest.py:532):
+   ```python
+   save_cached_doc("dropbox", entry.id, entry.content_hash, entry.name, text)
+   ```
+   `entry` is the `FileMetadata` from `list_inbox()` (ingest.py:424) and carries `id` and
+   `content_hash` — verified against dropbox 12.0.2. Cache before the `Processed/` move; the id and
+   content hash both survive it.
+   **Note the 15,000-char ceiling (F-24):** `extract_text` truncates, so this caches a truncated
+   document for large files. Accept it for now — it is exactly what ingest itself read, and a live
+   read of an uncached long file will store the full parse via step 4. Flagging as a deliberate,
+   cheap-to-reverse call: lifting it means giving `extract_text` a `limit` parameter defaulting to
+   15000 and passing `None` for the cache write.
+4. `agent.py` `read_dropbox_file` (agent.py:490-512) — metadata first, then cache, then parse:
+   ```python
+   def read_dropbox_file(file_path: str):
+       try:
+           meta = dbx.files_get_metadata(file_path)   # ~0.2-0.3s, no bytes transferred
+           cached = get_cached_doc("dropbox", meta.id, meta.content_hash)
+           if cached:
+               return cached[:3000]
+           metadata, response = dbx.files_download(file_path)
+           content = response.content
+           name = metadata.name.lower()
+           ...                                        # existing per-type parsing, unchanged
+           save_cached_doc("dropbox", meta.id, meta.content_hash, metadata.name, text)
+           return text[:3000]
+       except Exception as e:
+           return f"Dropbox read error: {e}"
+   ```
+   Restructure the per-type branches to assign `text` and fall through to one shared
+   cache-write/return, rather than returning from each branch. Keep `[File type not readable as
+   text: ...]` markers returning early and uncached (`save_cached_doc` also guards on `[`).
+   Bonus at no cost: with the cache checked before the extension test, a `.pptx` that ingest already
+   parsed becomes readable live — update the `read_dropbox_file` tool description (agent.py:654) to
+   say "PDF, DOCX, TXT, MD (plus PPTX when previously ingested)".
+5. `agent.py` — apply D-8 once decided. If (iii): add `"offset": {"type": "integer", "default": 0}`
+   to both tool schemas (agent.py:653-657, 666-670), slice `text[offset:offset+3000]`, and append
+   `f"\n[... {len(text) - offset - 3000} more characters — call again with offset={offset+3000}]"`
+   when truncated, so Claude knows more exists. Mention paging in `BASE_SYSTEM`'s tool list
+   (agent.py:745-746).
+6. `agent.py` `read_drive_file` (agent.py:539-559) — same pattern, zero extra API calls (F-25):
+   change line 541 to `fields="name, mimeType, version, modifiedTime"`, key on
+   `("drive", file_id, meta["version"])`, and write the cache after any successful parse or export.
+7. `agent.py` — one judgment call to flag in the commit message: `memory.py`'s connection is
+   `check_same_thread=False` and is shared between the bot process and the cron ingest process, with
+   `journal_mode=delete` and a 5s busy timeout (verified on the box). Adding 15-50 KB writes widens
+   the window for `database is locked` during a cron run. Cheap mitigation, additive and reversible
+   with `PRAGMA journal_mode=delete`: set `conn.execute("PRAGMA journal_mode=WAL")` right after the
+   connect in memory.py:17. Recommend doing it in this workstream; call it out explicitly so it can
+   be backed out on its own.
+
+**Acceptance checklist**
+
+- [ ] Drop a fresh text PDF into `/Dot Dump`, run ingest, then `SELECT source, file_key, revision,
+      filename, char_count FROM doc_cache` shows one row keyed by `id:...`.
+- [ ] Immediately afterwards, `read_dropbox_file("/Dot Dump/Processed/<name>.pdf")` — the *post-move*
+      path — returns the cached text (F-21's core regression test). Confirm with a log line or by
+      checking `last_read_at` moved.
+- [ ] A file never ingested reads live, then produces a `doc_cache` row; the second read does not
+      re-download (verify by timing, or by temporarily logging the cache branch).
+- [ ] Edit a cached Dropbox file (append a line), read again — content reflects the edit and
+      `updated_at`/`revision` changed.
+- [ ] Rename or move a cached file in Dropbox, read at the new path — still a cache hit, no
+      duplicate row (this is what `content_hash` + `id` buy).
+- [ ] `read_drive_file` on a Google Doc caches and re-serves; editing the doc busts it.
+- [ ] `[File type not readable as text: ...]` and error strings never land in `doc_cache`.
+- [ ] Bot restarts cleanly on a database that already has the table, and on one that doesn't
+      (fresh-install path through `executescript`).
+
+**UX impact:** additive and mostly invisible. Re-reads get faster; long documents behave as they do
+today unless D-8 (iii) is taken, in which case Claude gains the ability to page further into a
+document it previously could only see the first 3,000 chars of. No existing read regresses: a cache
+miss is exactly today's code path.
+**Cost impact:** no new cost line. Dropbox adds one metadata call per read (~0.2-0.3s, free tier,
+no bytes); Drive adds nothing. Storage: 206 ingested documents at ≤15 KB each ≈ 3 MB against a
+current 8 MB `dot.db`; even 1,000 cached documents with transcriptions is ~25 MB. Claude spend is
+unchanged by this workstream (it only avoids local re-parsing).
+**Effort:** ~half a day, plus ~1 hour for D-8 (iii).
+
+---
+
+## WS-12 — Full deck transcription at ingest for image-only PDFs (D-7, F-26, F-27)
+
+**Goal:** the ~27% of decks with no text layer get a verbatim markdown transcription stored in
+`doc_cache` at ingest time, so a live re-read returns the actual deck contents instead of a marker —
+at zero marginal cost on every read after the first. Depends on WS-11.
+
+**Confirmed decisions:** D-7 (pending Joey — recommendation: option (b), transcription).
+
+**Steps — all in `ingest.py`**
+
+1. Extend `EXTRACTION_SYSTEM` (ingest.py:170-191) with a transcription contract *after* the existing
+   facts contract, ordered so facts are emitted first (F-27):
+   ```
+   After the JSON array, output a line containing exactly ===TRANSCRIPT=== and then a faithful
+   markdown transcription of the document: every slide/page in order, headed "## Slide N", with all
+   visible text, numbers, table contents, and chart labels. Describe images only when they carry
+   information the text does not. Do not summarise or editorialise.
+   ```
+   Only the native-PDF call should ask for this; keep the text path's prompt as-is (it already has
+   the text locally). Simplest way to avoid drift: define `PDF_EXTRACTION_SYSTEM = EXTRACTION_SYSTEM
+   + "\n\n" + TRANSCRIPT_CONTRACT` and pass it only at ingest.py:243.
+2. `extract_facts_from_pdf_with_claude` (ingest.py:220-263) — raise `max_tokens` from 2000 to 8000
+   (ingest.py:242) and return both parts:
+   ```python
+   raw = response.content[0].text
+   head, _, transcript = raw.partition("===TRANSCRIPT===")
+   facts = parse_json_array(head)
+   if not facts:
+       facts = parse_json_array(raw)   # model ignored the delimiter — behave exactly as before
+   facts = [f for f in facts if isinstance(f, str) and len(f) > 10]
+   return facts, transcript.strip()
+   ```
+   Change the signature to `-> tuple[list, str]` and update the two early-return paths
+   (ingest.py:229, 235) to `return [], ""`. This is the F-27 safeguard: a response truncated at
+   `max_tokens` loses transcript tail only — the facts, already parsed from the prefix, still save
+   and the deck still reaches `Processed/`.
+3. `run()` (ingest.py:520) — unpack and cache:
+   ```python
+   facts, transcript = extract_facts_from_pdf_with_claude(content, entry.name)
+   if not facts:
+       ...  # unchanged Failed/ handling
+   if transcript:
+       save_cached_doc("dropbox", entry.id, entry.content_hash, entry.name, transcript, kind="vision")
+   ```
+   Failure to transcribe must never route a deck to `Failed/` — the `if not facts` guard stays the
+   only gate.
+4. `README.md` — in "Ingestion pipeline", extend the image-based-PDF bullet: Claude now also returns
+   a markdown transcription which is cached so later live reads of the deck are free. Update the
+   "Designed pitch decks" line in "Running costs" from $0.10-0.20 to $0.15-0.25 per deck.
+5. `ROADMAP.md` — move the planned entry added by this review into Shipped when this lands.
+
+**Acceptance checklist**
+
+- [ ] Re-drop a known image-only deck (e.g. `Clusterlab - Pitch deck.pdf`, measured 0 extractable
+      chars) into `/Dot Dump`; ingest produces the usual 5-20 facts **and** a `doc_cache` row with
+      `kind='vision'` whose length is in the thousands of characters.
+- [ ] `read_dropbox_file` on that deck's `Processed/` path returns slide text, not the WS-10 marker.
+- [ ] Spot-check the transcription against the actual slides for 2-3 slides — numbers and company
+      names must match, not be paraphrased.
+- [ ] Force a truncated response (temporarily set `max_tokens=300`) and confirm the deck still gets
+      its facts and still reaches `Processed/` — no `Failed/`, no Telegram alert (F-27 regression).
+- [ ] A text-layer PDF is unaffected: no second Claude call, no `kind='vision'` row, same fact count
+      as before.
+- [ ] `parse_json_array` in `memory.py` is unchanged (the delimiter split happens in `ingest.py`).
+
+**UX impact:** additive. Facts extraction behaves exactly as today; the only visible change is that
+asking Dot to re-read an image deck now works. Ingest runs ~10-30s longer per image deck (cron job,
+invisible to Joey).
+**Cost impact:** no new cost line. ~4-6k extra output tokens per image-only PDF ≈ $0.04-0.06 at
+$10/M, i.e. ~$1/month at the observed rate of ~22 image decks/month (206 documents ingested since
+mid-June; 27% image-only in the recent sample). Every subsequent read of that deck is $0 instead of
+a failed read or a fresh vision call.
+**Effort:** ~half a day including transcription spot-checks.
+
+---
+
+## WS-13 — Live vision fallback for un-ingested image PDFs (D-9) — ship last, only if approved
+
+**Goal:** an image-only PDF that never passed through `/Dot Dump` (i.e. most of Joey's Dropbox and
+all of Drive) becomes readable on demand, once, and is cached thereafter. Depends on WS-10, WS-11,
+WS-12.
+
+**Confirmed decisions:** D-9 (pending Joey — recommendation: yes, gated as below).
+
+**Steps**
+
+1. `agent.py` — factor the vision read so `ingest.py` stays the single owner of the prompt. Cleanest
+   given the conventions (module-level singletons, inline imports for rare paths): add
+   `transcribe_pdf_with_claude(content: bytes, filename: str) -> str` to `ingest.py` next to
+   `extract_facts_from_pdf_with_claude`, reusing `PDF_SIZE_CAP`, `compress_pdf`, and the 100-page
+   check, and import it lazily inside the tool function in `agent.py` (`from ingest import
+   transcribe_pdf_with_claude`). **Verify before implementing:** importing `ingest` from `agent`
+   pulls in a second `Anthropic()` client and a second `dropbox.Dropbox()` at module scope
+   (ingest.py:42-48) — acceptable inside a lazy function-level import, but confirm it does not
+   re-trigger `load_dotenv` side effects or the `.ingest.lock` path (it should not; the lock lives
+   under `if __name__ == "__main__"`, ingest.py:576-586). If it does, move the shared helper into a
+   new `docread.py` imported by both instead.
+2. `agent.py` `read_dropbox_file` — on a local parse that hits the WS-10 marker, and only for PDFs
+   under the existing size/page caps, call the transcriber, cache with `kind='vision'`, and return
+   it. Prefix the result with a one-line note (`[Transcribed from an image-based PDF by Claude —
+   text is a transcription, not the original text layer.]`) so Claude does not quote it as
+   byte-exact.
+3. Keep it single-shot: never call vision twice for the same file in one turn, and never for a file
+   whose `doc_cache` row already exists at the same revision.
+4. `README.md` — document the behaviour and its cost under "What the agent can do".
+
+**Acceptance checklist**
+
+- [ ] Reading an image-only PDF that lives *outside* `/Dot Dump` returns real slide text and creates
+      a `kind='vision'` `doc_cache` row.
+- [ ] The second read of the same file is instant and makes no Claude call.
+- [ ] An oversized (>24 MB post-compression) or >100-page PDF returns the WS-10 marker, not an
+      exception, and is not cached.
+- [ ] A text-layer PDF never triggers a vision call (check the API log for the turn).
+- [ ] The turn does not exceed the agent's 15-iteration cap or time out in Telegram.
+
+**UX impact:** additive; the failure case becomes a success case. The cost is latency — 20-60s on
+the turn that triggers it — so the tool result note and `BASE_SYSTEM` should be clear that this
+happens at most once per file.
+**Cost impact:** $0.10-0.20 per *newly* transcribed image PDF, paid once per file ever, only when
+Joey actually asks for one. No new cost line. Bounded by the existing size/page caps; if it ever
+feels loose, the cheap reversal is to require the file to be under N pages.
+**Effort:** ~half a day, most of it in verifying the import-boundary question in step 1.
+
+---
+
+## Execution order (2026-08-20 pass)
+
+WS-10 first — it is an hour, it is decision-independent, and it converts a silent failure into a
+visible one. Then WS-11 (needs D-8 for step 5 only; steps 1-4, 6, 7 can land without it). Then WS-12
+(needs D-7). WS-13 last and only if D-9 is a yes. Do not start WS-12 before WS-11 — it has nowhere
+to store a transcription until `doc_cache` exists.

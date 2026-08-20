@@ -2,6 +2,18 @@
 
 ## Planned
 
+### Document read cache + verbatim deck reads — planned 2026-08-20
+
+A `doc_cache` table in `dot.db` keyed on stable file identity (Dropbox file `id` + `content_hash`,
+Drive `fileId` + `version`) so a document parsed once is not re-parsed on every live read, plus a
+full markdown transcription of image-only pitch decks captured during ingestion so `read_dropbox_file`
+can return their actual contents. Reviewed and planned in `docs/IMPLEMENTATION_PLAN.md` (WS-10 to
+WS-13, findings F-21 to F-27); three product decisions (D-7, D-8, D-9) are open.
+
+> Known gap until this ships: `read_dropbox_file` / `read_drive_file` return whitespace with no error
+> marker for PDFs with no text layer (~27% of recently ingested decks). Ingestion reads those decks
+> correctly via Claude's vision path; only the live re-read is affected. WS-10 fixes the silent part.
+
 ---
 
 ## Shipped
