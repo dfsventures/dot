@@ -46,7 +46,7 @@ dbx = dbx_lib.Dropbox(
 # ── MEMORY (shared with ingest.py) ────────────────────────────────────────────
 from memory import (
     save_memory, delete_memory, get_all_memories,
-    retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array,
+    retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array, response_text,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
@@ -68,7 +68,7 @@ def extract_and_save_memories(conversation):
             system='Extract facts worth remembering. Return ONLY a JSON array of strings. If nothing, return []. Focus on people, companies, deals, preferences.',
             messages=[{"role": "user", "content": convo_text}]
         )
-        facts = parse_json_array(response.content[0].text)
+        facts = parse_json_array(response_text(response))
         print(f"Extracted facts: {facts}")
         for fact in facts:
             if fact and len(fact) > 10:
@@ -123,7 +123,7 @@ def compress_history(conversation: list) -> list:
             system="Summarise this conversation history concisely, preserving all key facts, decisions, and context that would be needed to continue the conversation intelligently. Be dense — this replaces the full history.",
             messages=[{"role": "user", "content": convo_text}]
         )
-        summary = r.content[0].text.strip()
+        summary = response_text(r).strip()
         summary_message = {
             "role": "user",
             "content": f"[Earlier conversation summary]\n{summary}"
@@ -1186,7 +1186,7 @@ async def cmd_log(update, context):
             system='Extract facts worth remembering from this note or conversation. Return ONLY a JSON array of strings. Each fact must be self-contained. Focus on people, companies, deals, decisions, commitments. If nothing worth keeping, return [].',
             messages=[{"role": "user", "content": text}]
         )
-        facts = parse_json_array(resp.content[0].text)
+        facts = parse_json_array(response_text(resp))
         saved = 0
         saved_facts = []
         for fact in facts:

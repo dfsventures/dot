@@ -53,7 +53,7 @@ PROCESSED_FOLDER = "/Dot Dump/Processed"
 FAILED_FOLDER    = "/Dot Dump/Failed"
 
 # ── MEMORY (shared with agent.py) ─────────────────────────────────────────────
-from memory import conn, save_memory, parse_json_array, list_deals, save_cached_doc
+from memory import conn, save_memory, parse_json_array, list_deals, save_cached_doc, response_text
 
 def _find_deal_match(fact: str, deal_names: list) -> str | None:
     """Return the first active deal company name found in the fact, or None."""
@@ -269,7 +269,7 @@ def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> tuple[l
                 ],
             }],
         )
-        raw = response.content[0].text
+        raw = response_text(response)
         head, _, transcript = raw.partition("===TRANSCRIPT===")
         facts = parse_json_array(head)
         if not facts:
@@ -327,7 +327,7 @@ def transcribe_pdf_with_claude(content: bytes, filename: str) -> str:
                 ],
             }],
         )
-        return response.content[0].text.strip()
+        return response_text(response).strip()
     except Exception as e:
         print(f"  Claude PDF transcription error: {e}")
         return ""
@@ -345,7 +345,7 @@ def extract_facts_with_claude(text: str, filename: str) -> list:
                 "content": f"Document filename: {filename}\n\nContent:\n{text}"
             }]
         )
-        facts = parse_json_array(response.content[0].text)
+        facts = parse_json_array(response_text(response))
         return [f for f in facts if isinstance(f, str) and len(f) > 10]
     except Exception as e:
         print(f"  Claude extraction error: {e}")

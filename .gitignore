@@ -8,6 +8,7 @@ credentials.json
 # Personal data stores (memories, conversation history, vector index)
 dot.db
 dot.db.*
+dot.db-*
 session.json
 session.json.*
 sessions/

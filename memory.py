@@ -337,6 +337,12 @@ def list_deals(stage: str = None) -> list:
         for r in rows
     ]
 
+# ── CLAUDE RESPONSE HELPERS ─────────────────────────────────────────────────────
+def response_text(response) -> str:
+    """First text block's content. Sonnet 5 runs adaptive thinking by default, so
+    content[0] is often a ThinkingBlock, not the TextBlock — never index content[0] directly."""
+    return next((b.text for b in response.content if b.type == "text"), "")
+
 # ── JSON PARSING ──────────────────────────────────────────────────────────────
 def parse_json_array(raw: str) -> list:
     """Parse a JSON array from model output, tolerating markdown code fences."""
