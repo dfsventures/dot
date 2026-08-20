@@ -49,7 +49,7 @@ from memory import (
     retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
-    retrieve_relevant_procedures,
+    retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -500,24 +500,34 @@ def _pdf_text_or_marker(content: bytes, label: str) -> str:
                 f"ingested from this file before telling Joey anything about its contents.]")
     return text
 
-def read_dropbox_file(file_path: str):
+def read_dropbox_file(file_path: str, offset: int = 0):
     try:
-        metadata, response = dbx.files_download(file_path)
-        content = response.content
-        name = metadata.name.lower()
-        if name.endswith(('.txt', '.md')):
-            return content.decode('utf-8', errors='ignore')[:3000]
-        elif name.endswith('.pdf'):
-            try:
-                return _pdf_text_or_marker(content, metadata.name)[:3000]
-            except Exception as e:
-                return f"[PDF read error: {e}]"
-        elif name.endswith('.docx'):
-            from docx import Document
-            doc = Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs)[:3000]
+        meta = dbx.files_get_metadata(file_path)   # ~0.2-0.3s, no bytes transferred
+        cached = get_cached_doc("dropbox", meta.id, meta.content_hash)
+        if cached:
+            text = cached
         else:
-            return f"[File type not readable as text: {name}]"
+            metadata, response = dbx.files_download(file_path)
+            content = response.content
+            name = metadata.name.lower()
+            if name.endswith(('.txt', '.md')):
+                text = content.decode('utf-8', errors='ignore')
+            elif name.endswith('.pdf'):
+                try:
+                    text = _pdf_text_or_marker(content, metadata.name)
+                except Exception as e:
+                    return f"[PDF read error: {e}]"
+            elif name.endswith('.docx'):
+                from docx import Document
+                doc = Document(io.BytesIO(content))
+                text = "\n".join(p.text for p in doc.paragraphs)
+            else:
+                return f"[File type not readable as text: {name}]"
+            save_cached_doc("dropbox", meta.id, meta.content_hash, metadata.name, text)
+        chunk = text[offset:offset + 3000]
+        if offset + 3000 < len(text):
+            chunk += f"\n[... {len(text) - offset - 3000} more characters — call again with offset={offset + 3000}]"
+        return chunk
     except Exception as e:
         return f"Dropbox read error: {e}"
 
@@ -546,23 +556,34 @@ _DRIVE_EXPORTS = {
     'application/vnd.google-apps.presentation': 'text/plain',
 }
 
-def read_drive_file(file_id: str):
+def read_drive_file(file_id: str, offset: int = 0):
     try:
-        meta = drive_work.files().get(fileId=file_id, fields="name, mimeType").execute()
+        meta = drive_work.files().get(fileId=file_id, fields="name, mimeType, version, modifiedTime").execute()
         name, mime = meta['name'].lower(), meta['mimeType']
-        if mime in _DRIVE_EXPORTS:
-            content = drive_work.files().export(fileId=file_id, mimeType=_DRIVE_EXPORTS[mime]).execute()
-            return content.decode('utf-8', errors='ignore')[:3000] if isinstance(content, bytes) else str(content)[:3000]
-        content = drive_work.files().get_media(fileId=file_id).execute()
-        if name.endswith(('.txt', '.md', '.csv')):
-            return content.decode('utf-8', errors='ignore')[:3000]
-        elif name.endswith('.pdf'):
-            return _pdf_text_or_marker(content, meta['name'])[:3000]
-        elif name.endswith('.docx'):
-            from docx import Document
-            doc = Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs)[:3000]
-        return f"[File type not readable as text: {meta['name']}]"
+        cached = get_cached_doc("drive", file_id, meta['version'])
+        if cached:
+            text = cached
+        else:
+            if mime in _DRIVE_EXPORTS:
+                content = drive_work.files().export(fileId=file_id, mimeType=_DRIVE_EXPORTS[mime]).execute()
+                text = content.decode('utf-8', errors='ignore') if isinstance(content, bytes) else str(content)
+            else:
+                content = drive_work.files().get_media(fileId=file_id).execute()
+                if name.endswith(('.txt', '.md', '.csv')):
+                    text = content.decode('utf-8', errors='ignore')
+                elif name.endswith('.pdf'):
+                    text = _pdf_text_or_marker(content, meta['name'])
+                elif name.endswith('.docx'):
+                    from docx import Document
+                    doc = Document(io.BytesIO(content))
+                    text = "\n".join(p.text for p in doc.paragraphs)
+                else:
+                    return f"[File type not readable as text: {meta['name']}]"
+            save_cached_doc("drive", file_id, meta['version'], meta['name'], text)
+        chunk = text[offset:offset + 3000]
+        if offset + 3000 < len(text):
+            chunk += f"\n[... {len(text) - offset - 3000} more characters — call again with offset={offset + 3000}]"
+        return chunk
     except Exception as e:
         return f"Drive read error: {e}"
 
@@ -659,8 +680,11 @@ TOOLS = [
     },
     {
         "name": "read_dropbox_file",
-        "description": "Download and read a Dropbox file by its full path (get path from search_dropbox first). Supports PDF, DOCX, TXT, MD.",
-        "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
+        "description": "Download and read a Dropbox file by its full path (get path from search_dropbox first). Supports PDF, DOCX, TXT, MD (plus PPTX when previously ingested). Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
+        "input_schema": {"type": "object", "properties": {
+            "file_path": {"type": "string"},
+            "offset": {"type": "integer", "default": 0}
+        }, "required": ["file_path"]}
     },
     {
         "name": "search_drive",
@@ -672,8 +696,11 @@ TOOLS = [
     },
     {
         "name": "read_drive_file",
-        "description": "Read a Google Drive file by ID (get ID from search_drive first). Supports Google Docs/Sheets/Slides (exported as text) plus PDF, DOCX, TXT, MD, CSV.",
-        "input_schema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}
+        "description": "Read a Google Drive file by ID (get ID from search_drive first). Supports Google Docs/Sheets/Slides (exported as text) plus PDF, DOCX, TXT, MD, CSV. Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
+        "input_schema": {"type": "object", "properties": {
+            "file_id": {"type": "string"},
+            "offset": {"type": "integer", "default": 0}
+        }, "required": ["file_id"]}
     },
     {
         "name": "update_deal",
@@ -750,8 +777,8 @@ Your tools and what they contain:
 - create_gmail_draft: create a Gmail draft for Joey to review — NEVER sends automatically
 - list_calendar_events / get_calendar_event / create_calendar_event / update_calendar_event / delete_calendar_event: Joey's work Google Calendar (read and write)
 - search_granola / read_granola: Call and meeting notes from Granola
-- search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents)
-- search_drive / read_drive_file: Joey's Google Drive (read-only)
+- search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents). Reads return 3,000 characters at a time — if a result says more characters remain, call again with the given offset to page further into a long document rather than assuming that's all there is.
+- search_drive / read_drive_file: Joey's Google Drive (read-only), same 3,000-char paging via offset
 - web_search: Real-time web search
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something

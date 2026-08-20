@@ -15,6 +15,13 @@ CHROMA_PATH = os.path.join(_BASE_DIR, "chroma_db")
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# WAL mode: memories/dot.db is shared between the bot process and the cron
+# ingest process (check_same_thread=False above). doc_cache writes (WS-11) add
+# 15-50 KB writes on top of existing traffic, which widens the window for
+# "database is locked" under the default rollback-journal mode. WAL lets
+# readers and a single writer proceed concurrently. Additive and reversible —
+# back out with PRAGMA journal_mode=DELETE if this ever misbehaves.
+conn.execute("PRAGMA journal_mode=WAL")
 conn.executescript("""
     CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +55,20 @@ conn.executescript("""
         created_at TEXT DEFAULT (datetime('now')),
         last_used_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS doc_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,              -- 'dropbox' | 'drive'
+        file_key TEXT NOT NULL,            -- Dropbox file id / Drive fileId — stable across moves
+        revision TEXT NOT NULL DEFAULT '', -- Dropbox content_hash / Drive version
+        filename TEXT DEFAULT '',
+        kind TEXT DEFAULT 'text',          -- 'text' (local parse) | 'vision' (Claude transcription)
+        content TEXT NOT NULL,
+        char_count INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        last_read_at TEXT,
+        UNIQUE (source, file_key)
+    );
 """)
 conn.commit()
 
@@ -73,6 +94,38 @@ def save_memory(content: str, tags: str = ""):
         )
     except Exception as e:
         print(f"ChromaDB write error: {e}")
+
+def get_cached_doc(source: str, file_key: str, revision: str) -> str | None:
+    """Cached parse for this exact file revision, or None. A revision mismatch is a miss."""
+    row = conn.execute(
+        "SELECT content FROM doc_cache WHERE source = ? AND file_key = ? AND revision = ?",
+        (source, file_key, revision),
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        "UPDATE doc_cache SET last_read_at = datetime('now') WHERE source = ? AND file_key = ?",
+        (source, file_key),
+    )
+    conn.commit()
+    return row[0]
+
+def save_cached_doc(source: str, file_key: str, revision: str, filename: str,
+                    content: str, kind: str = "text"):
+    if not content or content.startswith("["):
+        return  # never cache an error marker or an empty parse
+    try:
+        conn.execute(
+            "INSERT INTO doc_cache (source, file_key, revision, filename, kind, content, char_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source, file_key) DO UPDATE SET "
+            "revision=excluded.revision, filename=excluded.filename, kind=excluded.kind, "
+            "content=excluded.content, char_count=excluded.char_count, updated_at=datetime('now')",
+            (source, file_key, revision, filename, kind, content, len(content)),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"doc_cache write error: {e}")
 
 def delete_memory(content: str) -> bool:
     """Delete a memory from SQLite AND ChromaDB. Returns True if found."""

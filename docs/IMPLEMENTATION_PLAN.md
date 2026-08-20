@@ -752,7 +752,7 @@ any read that works today.
 
 ---
 
-## WS-11 — `doc_cache`: identity-keyed parsed-document cache (F-21, F-23, F-24, F-25)
+## WS-11 — `doc_cache`: identity-keyed parsed-document cache (F-21, F-23, F-24, F-25) — ✅ Done, 2026-08-20
 
 **Goal:** a document parsed once is never re-parsed while its bytes are unchanged; `read_dropbox_file`
 answers from `dot.db` when the cached copy still matches the live file, and backfills the cache on

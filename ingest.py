@@ -53,7 +53,7 @@ PROCESSED_FOLDER = "/Dot Dump/Processed"
 FAILED_FOLDER    = "/Dot Dump/Failed"
 
 # ── MEMORY (shared with agent.py) ─────────────────────────────────────────────
-from memory import conn, save_memory, parse_json_array, list_deals
+from memory import conn, save_memory, parse_json_array, list_deals, save_cached_doc
 
 def _find_deal_match(fact: str, deal_names: list) -> str | None:
     """Return the first active deal company name found in the fact, or None."""
@@ -530,6 +530,9 @@ def run():
                     continue
                 else:
                     print(f"  Extracted {len(text):,} chars of text")
+                    # Cache the full parse for free re-reads later (WS-11). Keyed on the
+                    # Dropbox file id + content_hash — both survive the Processed/ move below.
+                    save_cached_doc("dropbox", entry.id, entry.content_hash, entry.name, text)
                     facts = extract_facts_with_claude(text, entry.name)
                     if not facts:
                         print(f"  No facts extracted from text. Moving to Failed.")
