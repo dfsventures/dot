@@ -190,6 +190,17 @@ Example output:
  "Acme Pay's key metric: 40,000 monthly active users as of Q1 2026.",
  "Founders have prior experience at a major African fintech and a global exchange."]"""
 
+# Only the native-PDF call (image-only decks) asks for a transcript — the text path already
+# has the text locally. Facts are required first, delimiter second, transcript last (F-27):
+# a response truncated at max_tokens then loses only the transcript tail, never the facts.
+TRANSCRIPT_CONTRACT = """
+After the JSON array, output a line containing exactly ===TRANSCRIPT=== and then a faithful
+markdown transcription of the document: every slide/page in order, headed "## Slide N", with all
+visible text, numbers, table contents, and chart labels. Describe images only when they carry
+information the text does not. Do not summarise or editorialise."""
+
+PDF_EXTRACTION_SYSTEM = EXTRACTION_SYSTEM + "\n\n" + TRANSCRIPT_CONTRACT
+
 PDF_SIZE_CAP = 24 * 1024 * 1024  # base64 inflates ~33%, API request limit is ~32MB
 
 def compress_pdf(content: bytes) -> bytes:
@@ -217,30 +228,32 @@ def compress_pdf(content: bytes) -> bytes:
         print(f"  Ghostscript compression failed: {e}")
         return content
 
-def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> list:
+def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> tuple[list, str]:
     """Send the PDF itself to Claude — handles image-based decks with no text layer.
-    API limits: ~32MB request (base64 inflates ~33%, so cap raw at 24MB), 100 pages."""
+    API limits: ~32MB request (base64 inflates ~33%, so cap raw at 24MB), 100 pages.
+    Returns (facts, transcript) — transcript is '' if the model didn't emit one
+    (truncated response, or non-image PDF path never calling this at all)."""
     if len(content) > PDF_SIZE_CAP:
         print(f"  PDF too large ({len(content) / 1e6:.0f}MB) — compressing with Ghostscript...")
         content = compress_pdf(content)
         print(f"  Compressed to {len(content) / 1e6:.1f}MB")
     if len(content) > PDF_SIZE_CAP:
         print(f"  Still too large for Claude API after compression (> 24MB cap)")
-        return []
+        return [], ""
     try:
         import PyPDF2
         n_pages = len(PyPDF2.PdfReader(io.BytesIO(content)).pages)
         if n_pages > 100:
             print(f"  PDF has {n_pages} pages (API limit is 100)")
-            return []
+            return [], ""
     except Exception:
         pass  # unreadable page count — let the API decide
     import base64
     try:
         response = client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=2000,
-            system=EXTRACTION_SYSTEM,
+            max_tokens=8000,
+            system=PDF_EXTRACTION_SYSTEM,
             messages=[{
                 "role": "user",
                 "content": [
@@ -256,11 +269,16 @@ def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> list:
                 ],
             }],
         )
-        facts = parse_json_array(response.content[0].text)
-        return [f for f in facts if isinstance(f, str) and len(f) > 10]
+        raw = response.content[0].text
+        head, _, transcript = raw.partition("===TRANSCRIPT===")
+        facts = parse_json_array(head)
+        if not facts:
+            facts = parse_json_array(raw)   # model ignored the delimiter — behave exactly as before
+        facts = [f for f in facts if isinstance(f, str) and len(f) > 10]
+        return facts, transcript.strip()
     except Exception as e:
         print(f"  Claude PDF extraction error: {e}")
-        return []
+        return [], ""
 
 def extract_facts_with_claude(text: str, filename: str) -> list:
     if not text or text.startswith('['):
@@ -517,12 +535,15 @@ def run():
                     # Image-based PDF (designed pitch decks) — no local text layer.
                     # Send the PDF itself to Claude, which reads pages visually.
                     print(f"  Little/no text layer — sending PDF to Claude natively")
-                    facts = extract_facts_from_pdf_with_claude(content, entry.name)
+                    facts, transcript = extract_facts_from_pdf_with_claude(content, entry.name)
                     if not facts:
                         print(f"  No facts from native PDF read. Moving to Failed.")
                         move_file(entry.path_display, FAILED_FOLDER, entry.name)
                         _notify_failure(f"⚠️ Dot Dump: couldn't process {entry.name} — moved to Failed/")
                         continue
+                    if transcript:
+                        save_cached_doc("dropbox", entry.id, entry.content_hash, entry.name,
+                                        transcript, kind="vision")
                 elif not text or text.startswith('['):
                     print(f"  Could not extract text. Moving to Failed.")
                     move_file(entry.path_display, FAILED_FOLDER, entry.name)

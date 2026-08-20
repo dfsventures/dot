@@ -115,7 +115,7 @@ History is token-estimated (~4 chars/token) and compressed once it exceeds an 80
 Supported types: PDF, DOCX, PPTX, XLSX/XLS, CSV, TXT, MD.
 
 - **Text-layer documents** are parsed locally, then Claude distills 5–20 self-contained facts per document via a structured extraction prompt.
-- **Image-based PDFs** (designed pitch decks with no text layer) are detected and sent to Claude *natively* as base64 documents — Claude reads the pages visually. Oversized PDFs are downsampled with Ghostscript (`/ebook`, ~150dpi) to fit under the API's ~32MB request limit (24MB raw, since base64 inflates ~33%); the 100-page API limit is also checked.
+- **Image-based PDFs** (designed pitch decks with no text layer) are detected and sent to Claude *natively* as base64 documents — Claude reads the pages visually. Oversized PDFs are downsampled with Ghostscript (`/ebook`, ~150dpi) to fit under the API's ~32MB request limit (24MB raw, since base64 inflates ~33%); the 100-page API limit is also checked. Alongside the facts, Claude also returns a faithful markdown transcription of the deck (every slide, in order), which is cached in `doc_cache` — so a later `read_dropbox_file`/`read_drive_file` on that deck returns the real slide text instead of a "no text layer" marker, at no extra cost. A response truncated mid-transcription only loses the transcript tail; the facts (extracted first, before the transcript) still save normally.
 - **Large spreadsheets/CSVs** (50+ rows) skip Claude entirely and ingest row-by-row — `Header: value | Header: value` per row — which is far richer than a summary and costs nothing. Small sheets still go through Claude.
 - Every memory is tagged with `source:<filename>`; ingested files are tracked in SQLite so re-runs are idempotent.
 - An `flock`-based single-instance lock prevents a cron run and a manual run from contending on the database.
@@ -172,7 +172,7 @@ That's about **3¢ per API call**. A substantive question usually triggers 2–4
 
 Ingestion costs scale with what you drop in the Dropbox folder:
 
-- **Designed pitch decks** (image-based PDFs sent to Claude natively): roughly **$0.10–0.20 per deck** — page images dominate the input tokens.
+- **Designed pitch decks** (image-based PDFs sent to Claude natively): roughly **$0.15–0.25 per deck** — page images dominate the input tokens, plus ~4,000-6,000 extra output tokens for the cached verbatim transcription.
 - **Text documents** (reports, notes, DOCX): a **cent or two** each.
 - **Large spreadsheets/CSVs**: **$0** — 50+ row files are ingested row-by-row with no model call.
 

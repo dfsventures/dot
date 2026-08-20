@@ -909,7 +909,7 @@ unchanged by this workstream (it only avoids local re-parsing).
 
 ---
 
-## WS-12 — Full deck transcription at ingest for image-only PDFs (D-7, F-26, F-27)
+## WS-12 — Full deck transcription at ingest for image-only PDFs (D-7, F-26, F-27) — ✅ Done, 2026-08-20
 
 **Goal:** the ~27% of decks with no text layer get a verbatim markdown transcription stored in
 `doc_cache` at ingest time, so a live re-read returns the actual deck contents instead of a marker —
