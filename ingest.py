@@ -280,6 +280,58 @@ def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> tuple[l
         print(f"  Claude PDF extraction error: {e}")
         return [], ""
 
+TRANSCRIBE_ONLY_SYSTEM = """You transcribe documents faithfully for an investor's personal AI agent.
+
+Produce a faithful markdown transcription of the document: every slide/page in order, headed
+"## Slide N", with all visible text, numbers, table contents, and chart labels. Describe images
+only when they carry information the text does not. Do not summarise or editorialise.
+Output ONLY the transcription — no preamble, no commentary, no facts list."""
+
+def transcribe_pdf_with_claude(content: bytes, filename: str) -> str:
+    """Live vision transcription of an image-only PDF that was never ingested (WS-13).
+    Same size/page caps and compression path as extract_facts_from_pdf_with_claude — reused
+    rather than duplicated. Returns '' on any failure or cap, never raises."""
+    if len(content) > PDF_SIZE_CAP:
+        print(f"  PDF too large ({len(content) / 1e6:.0f}MB) — compressing with Ghostscript...")
+        content = compress_pdf(content)
+        print(f"  Compressed to {len(content) / 1e6:.1f}MB")
+    if len(content) > PDF_SIZE_CAP:
+        print(f"  Still too large for Claude API after compression (> 24MB cap)")
+        return ""
+    try:
+        import PyPDF2
+        n_pages = len(PyPDF2.PdfReader(io.BytesIO(content)).pages)
+        if n_pages > 100:
+            print(f"  PDF has {n_pages} pages (API limit is 100)")
+            return ""
+    except Exception:
+        pass  # unreadable page count — let the API decide
+    import base64
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=8000,
+            system=TRANSCRIBE_ONLY_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64.standard_b64encode(content).decode(),
+                        },
+                    },
+                    {"type": "text", "text": f"Document filename: {filename}\n\nTranscribe this document."},
+                ],
+            }],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"  Claude PDF transcription error: {e}")
+        return ""
+
 def extract_facts_with_claude(text: str, filename: str) -> list:
     if not text or text.startswith('['):
         return []

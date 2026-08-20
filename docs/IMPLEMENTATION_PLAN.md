@@ -985,7 +985,7 @@ a failed read or a fresh vision call.
 
 ---
 
-## WS-13 — Live vision fallback for un-ingested image PDFs (D-9) — ship last, only if approved
+## WS-13 — Live vision fallback for un-ingested image PDFs (D-9) — ship last, only if approved — ✅ Done, 2026-08-20
 
 **Goal:** an image-only PDF that never passed through `/Dot Dump` (i.e. most of Joey's Dropbox and
 all of Drive) becomes readable on demand, once, and is cached thereafter. Depends on WS-10, WS-11,

@@ -500,6 +500,26 @@ def _pdf_text_or_marker(content: bytes, label: str) -> str:
                 f"ingested from this file before telling Joey anything about its contents.]")
     return text
 
+_VISION_TRANSCRIPTION_NOTE = (
+    "[Transcribed from an image-based PDF by Claude — text is a transcription, "
+    "not the original text layer.]\n\n"
+)
+
+def _vision_fallback_or_marker(content: bytes, marker: str, source: str, file_key: str,
+                               revision: str, filename: str) -> str:
+    """WS-13: on a WS-10 'no text layer' marker, try a one-shot live vision transcription of
+    an image-only PDF that was never ingested — gated by ingest.py's own size/page caps.
+    Caches the raw transcript (kind='vision') so a second read never re-calls Claude; the
+    disclaimer note is prepended only to this immediate return, not to the cached copy, so a
+    later cache hit stays reusable byte-for-byte. Falls back to the marker, uncached, if the
+    transcription is empty (oversized, too many pages, or an API failure)."""
+    from ingest import transcribe_pdf_with_claude
+    vision_text = transcribe_pdf_with_claude(content, filename)
+    if not vision_text:
+        return marker
+    save_cached_doc(source, file_key, revision, filename, vision_text, kind="vision")
+    return _VISION_TRANSCRIPTION_NOTE + vision_text
+
 def read_dropbox_file(file_path: str, offset: int = 0):
     try:
         meta = dbx.files_get_metadata(file_path)   # ~0.2-0.3s, no bytes transferred
@@ -517,6 +537,9 @@ def read_dropbox_file(file_path: str, offset: int = 0):
                     text = _pdf_text_or_marker(content, metadata.name)
                 except Exception as e:
                     return f"[PDF read error: {e}]"
+                if text.startswith("["):
+                    text = _vision_fallback_or_marker(content, text, "dropbox", meta.id,
+                                                       meta.content_hash, metadata.name)
             elif name.endswith('.docx'):
                 from docx import Document
                 doc = Document(io.BytesIO(content))
@@ -573,6 +596,9 @@ def read_drive_file(file_id: str, offset: int = 0):
                     text = content.decode('utf-8', errors='ignore')
                 elif name.endswith('.pdf'):
                     text = _pdf_text_or_marker(content, meta['name'])
+                    if text.startswith("["):
+                        text = _vision_fallback_or_marker(content, text, "drive", file_id,
+                                                           meta['version'], meta['name'])
                 elif name.endswith('.docx'):
                     from docx import Document
                     doc = Document(io.BytesIO(content))
@@ -680,7 +706,7 @@ TOOLS = [
     },
     {
         "name": "read_dropbox_file",
-        "description": "Download and read a Dropbox file by its full path (get path from search_dropbox first). Supports PDF, DOCX, TXT, MD (plus PPTX when previously ingested). Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
+        "description": "Download and read a Dropbox file by its full path (get path from search_dropbox first). Supports PDF, DOCX, TXT, MD (plus PPTX when previously ingested). Image-only PDFs (scanned/designed decks with no text layer) are transcribed live by Claude on first read and cached — this takes 20-60s the first time, then is instant. Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
         "input_schema": {"type": "object", "properties": {
             "file_path": {"type": "string"},
             "offset": {"type": "integer", "default": 0}
@@ -696,7 +722,7 @@ TOOLS = [
     },
     {
         "name": "read_drive_file",
-        "description": "Read a Google Drive file by ID (get ID from search_drive first). Supports Google Docs/Sheets/Slides (exported as text) plus PDF, DOCX, TXT, MD, CSV. Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
+        "description": "Read a Google Drive file by ID (get ID from search_drive first). Supports Google Docs/Sheets/Slides (exported as text) plus PDF, DOCX, TXT, MD, CSV. Image-only PDFs (scanned/designed decks with no text layer) are transcribed live by Claude on first read and cached — this takes 20-60s the first time, then is instant. Returns up to 3,000 characters starting at offset; if the result says more characters remain, call again with the suggested offset to page further into the document.",
         "input_schema": {"type": "object", "properties": {
             "file_id": {"type": "string"},
             "offset": {"type": "integer", "default": 0}
@@ -777,8 +803,8 @@ Your tools and what they contain:
 - create_gmail_draft: create a Gmail draft for Joey to review — NEVER sends automatically
 - list_calendar_events / get_calendar_event / create_calendar_event / update_calendar_event / delete_calendar_event: Joey's work Google Calendar (read and write)
 - search_granola / read_granola: Call and meeting notes from Granola
-- search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents). Reads return 3,000 characters at a time — if a result says more characters remain, call again with the given offset to page further into a long document rather than assuming that's all there is.
-- search_drive / read_drive_file: Joey's Google Drive (read-only), same 3,000-char paging via offset
+- search_dropbox / read_dropbox_file: Dropbox files (pitch decks, PDFs, documents). Reads return 3,000 characters at a time — if a result says more characters remain, call again with the given offset to page further into a long document rather than assuming that's all there is. An image-only PDF (no text layer) is transcribed live by Claude the first time anyone reads it and cached from then on — that first read takes 20-60 seconds, so don't assume the tool has hung.
+- search_drive / read_drive_file: Joey's Google Drive (read-only), same 3,000-char paging via offset and the same one-time live transcription for image-only PDFs
 - web_search: Real-time web search
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something

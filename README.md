@@ -49,7 +49,7 @@ Four modules:
 | `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
 
-Image-based PDFs (scanned or exported-as-images decks, no text layer) are readable through ingestion — drop them in Dropbox `/Dot Dump` and the ingest pipeline extracts facts via Claude — but `read_dropbox_file`/`read_drive_file` cannot re-read them live; they return an explicit "no text layer" marker instead of blank text. (Remove this note once WS-12/WS-13 land a cached transcription for live reads.)
+Image-based PDFs (scanned or exported-as-images decks, no text layer) are readable end to end. Decks ingested via Dropbox `/Dot Dump` get a full markdown transcription at ingest time, cached and served instantly on later reads. A deck that was *never* ingested — most of Joey's Dropbox, and all of Drive, since Drive files are never ingested — is transcribed live by Claude on the first `read_dropbox_file`/`read_drive_file` call that hits it (20–60 seconds, ~$0.10–0.20, gated to PDFs under the existing 24 MB/100-page caps) and cached from then on, so every file is at most one slow read away from being fully readable. A PDF that's too large or has too many pages still returns the explicit "no text layer" marker instead of an error or blank text.
 
 Plus Telegram commands (type `/` to see the full menu in the chat):
 

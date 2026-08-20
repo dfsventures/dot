@@ -2,22 +2,29 @@
 
 ## Planned
 
-### Document read cache + verbatim deck reads — planned 2026-08-20 (WS-10, WS-11, WS-12 shipped 2026-08-20; WS-13 in progress)
-
-A `doc_cache` table in `dot.db` keyed on stable file identity (Dropbox file `id` + `content_hash`,
-Drive `fileId` + `version`) so a document parsed once is not re-parsed on every live read, plus a
-full markdown transcription of image-only pitch decks captured during ingestion so `read_dropbox_file`
-can return their actual contents. Reviewed and planned in `docs/IMPLEMENTATION_PLAN.md` (WS-10 to
-WS-13, findings F-21 to F-27); all three product decisions (D-7, D-8, D-9) are confirmed.
-
-> Remaining gap: image-only PDFs that never passed through Dropbox `/Dot Dump` ingestion (most of
-> Joey's Dropbox, and all of Drive) still return the WS-10 "no text layer" marker on a live read —
-> there is no ingest-time transcription to serve from cache. WS-13 (live vision fallback, gated)
-> closes this; until it lands, ingest the file via `/Dot Dump` first if you need it readable live.
+*(nothing currently planned)*
 
 ---
 
 ## Shipped
+
+### Document read cache + verbatim deck reads ✓ — 2026-08-20 (WS-10 to WS-13)
+
+A `doc_cache` table in `dot.db` keyed on stable file identity (Dropbox file `id` + `content_hash`,
+Drive `fileId` + `version`) so a document parsed once is not re-parsed on every live read.
+`read_dropbox_file`/`read_drive_file` check the cache before downloading, backfill it on any miss,
+and take an optional `offset` argument to page past the 3,000-char return cap. Ingestion populates
+the cache for free on its existing text-extraction path. Image-only PDFs (designed decks with no
+text layer) get a full markdown transcription: at ingest time for anything dropped in `/Dot Dump`,
+or live — one-shot, cached thereafter, ~20-60s and ~$0.10-0.20 the first time — for any image-only
+PDF read via `read_dropbox_file`/`read_drive_file` that was never ingested (most of Joey's Dropbox,
+and all of Drive, since Drive files are never ingested). Reviewed and planned in
+`docs/IMPLEMENTATION_PLAN.md` (WS-10 to WS-13, findings F-21 to F-27); all three product decisions
+(D-7 full transcription at ingest, D-8 offset paging, D-9 gated live vision fallback) confirmed by
+Joey. WS-13 additionally covers Drive reads (`read_drive_file`) with the same live-vision fallback
+as Dropbox, even though the workstream's own steps only spelled out the Dropbox path in detail —
+the workstream's stated goal ("most of Joey's Dropbox and all of Drive") and F-25's observation
+that Drive is never ingested made the Drive gap worth closing in the same pass.
 
 ### Google Drive access ✓ — 2026-07-07
 
