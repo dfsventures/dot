@@ -1448,6 +1448,35 @@ async def error_handler(update, context):
         await _notify_owner(context, f"⚠️ Background job error: {context.error}")
 
 # ── MEETING PREP BRIEF (runs every 5 min, fires ~30 min before external meetings) ─
+def _is_preppable(event: dict, window_start, window_end, internal_domains: set) -> tuple:
+    """Pure classification (no API calls, no side effects — WS-19 test target): would
+    check_meeting_prep consider this event at all, and why/why not?
+
+    Combines both structural filters from D-10(a): F-29's real "starts within window"
+    check (Google Calendar's timeMin/timeMax is an overlap filter, not a starts-within
+    filter — an all-day event otherwise matches every 5-minute tick for its whole
+    duration) and F-30's external-attendee requirement. Does not know about mutes or
+    prep_log — those are stateful and stay in check_meeting_prep."""
+    start = event.get('start', {})
+    if 'dateTime' not in start:
+        return False, "all-day or date-only event"
+    from datetime import datetime
+    try:
+        start_dt = datetime.fromisoformat(start['dateTime'])
+    except ValueError:
+        return False, "malformed start.dateTime"
+    if not (window_start <= start_dt <= window_end):
+        return False, "overlaps the query window but does not start within it"
+    attendees = event.get('attendees', [])
+    external = [
+        a for a in attendees
+        if not a.get('self', False)
+        and not any(a.get('email', '').lower().endswith(f'@{d}') for d in internal_domains)
+    ]
+    if not external:
+        return False, "no external attendees"
+    return True, "starts within window with external attendee(s)"
+
 async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
 
@@ -1478,18 +1507,11 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
     for event in events:
         event_id = event.get('id', '')
 
-        # F-29: timeMin/timeMax on the Calendar API is an overlap filter (event.end > timeMin
-        # AND event.start < timeMax), not "starts within this window" — an all-day event
-        # matches every 5-minute tick for its entire duration. Filter client-side.
-        start = event.get('start', {})
-        if 'dateTime' not in start:
-            continue                      # all-day / date-only event — no "30 minutes before" exists
-        try:
-            start_dt = datetime.fromisoformat(start['dateTime'])
-        except ValueError:
-            continue
-        if not (window_start <= start_dt <= window_end):
-            continue                      # overlapping, but not starting in this window (F-29)
+        preppable, _reason = _is_preppable(event, window_start, window_end, _INTERNAL_DOMAINS)
+        if not preppable:
+            continue                      # all-day, malformed, out-of-window, or internal-only (F-29/F-30)
+
+        start_dt = datetime.fromisoformat(event['start']['dateTime'])  # already validated by _is_preppable
         occurrence = start_dt.isoformat()
 
         title = event.get('summary', 'Untitled')
@@ -1505,9 +1527,6 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
             if not a.get('self', False)
             and not any(a.get('email', '').lower().endswith(f'@{d}') for d in _INTERNAL_DOMAINS)
         ]
-
-        if not external:
-            continue
 
         names  = [a.get('displayName') or a.get('email', '') for a in external]
         emails = [a.get('email', '') for a in external]

@@ -1289,7 +1289,7 @@ Say no if you'd rather just tell me what went wrong at the end of the fortnight.
 
 # PHASE 0 — Gate. Ships before the two-week trial starts.
 
-## WS-14 — Meeting prep: fire only on real meetings, and make "stop" actually work (F-29, F-30, F-31, F-32; D-10)
+## WS-14 — Meeting prep: fire only on real meetings, and make "stop" actually work (F-29, F-30, F-31, F-32; D-10) — ✅ Done, 2026-08-21
 
 **Goal:** prep fires once per real, timed, external business meeting, and anything Joey tells Dot to
 stop prepping actually stops. This is the workstream that addresses why usage went to zero.
@@ -1485,7 +1485,7 @@ tables, ~1 KB. No new services.
 
 ---
 
-## WS-15 — Deterministic one-shot calls; no silent empty results (F-33, F-34)
+## WS-15 — Deterministic one-shot calls; no silent empty results (F-33, F-34) — ✅ Done, 2026-08-21
 
 **Goal:** verification reasoning stops leaking into visible output and stops eating the content
 budget; and a truncated or thinking-only response can never be mistaken for a valid empty result.
@@ -1582,7 +1582,7 @@ extraction calls is a straight *reduction*. No new services.
 
 ---
 
-## WS-16 — Put a relevance floor on memory retrieval (F-35, F-35a; D-11)
+## WS-16 — Put a relevance floor on memory retrieval (F-35, F-35a; D-11) — ✅ Done, 2026-08-21
 
 **Goal:** Dot stops injecting ~4,000 tokens of irrelevant context into every conversational turn.
 Cheapest, highest-leverage item in the plan: step 1 is roughly five lines.
@@ -1669,7 +1669,7 @@ Embeddings are local and free; the extra Chroma collection is disk only.
 
 ---
 
-## WS-17 — Cache the full parse, not the truncated one (F-36)
+## WS-17 — Cache the full parse, not the truncated one (F-36) — ✅ Done, 2026-08-21
 
 **Goal:** a cached document read never silently ends at 15,000 characters while reporting itself
 complete. Corrects the WS-11 premise.
@@ -1722,7 +1722,7 @@ absent. No interface change.
 
 ---
 
-## WS-18 — Make the trial survivable and measurable (F-37, F-40; D-12)
+## WS-18 — Make the trial survivable and measurable (F-37, F-40; D-12) — ✅ Done, 2026-08-21
 
 **Goal:** two weeks of use cannot be silently ended by a dead store or a dead API key, and it
 produces evidence rather than an impression.
@@ -1818,7 +1818,7 @@ makes no API call. Net disk change is *negative* after the ~57 MB of stale-artif
 
 ---
 
-## WS-19 — A narrow test file for Phase-0 logic only (F-41)
+## WS-19 — A narrow test file for Phase-0 logic only (F-41) — ✅ Done, 2026-08-21
 
 **Goal:** the specific bugs fixed in WS-14 to WS-17 cannot silently return. Deliberately **not** a
 test suite for Dot — that is Phase 1, and building one now would be exactly the "keep building"
@@ -1891,3 +1891,23 @@ plan should be written from the `feedback` table, not from a backlog.
 
 **Open decisions blocking full execution: D-10, D-11, D-12.** Roughly 60% of Phase 0 can proceed
 without any of them.
+
+---
+
+**Execution note (Alvin, 2026-08-21):** all three decisions (D-10, D-11, D-12) were confirmed by
+Joey before this pass started (see the decisions section above), so the interleaving this section
+describes — splitting WS-16 and WS-18 into sub-steps to get backups in place before the Chroma
+reindex — was no longer a hard blocker, just a safety ordering. Executed as six commits, one per
+workstream, in dependency order: **WS-15 → WS-14 → WS-18 → WS-17 → WS-16 → WS-19.** WS-18
+(backups, tested for real — a real `backup.sh` run plus a real restore rehearsal into a scratch
+directory) landed before WS-17's backfill and WS-16's reindex touched `doc_cache`/Chroma, which is
+what this section's ordering rationale actually required; WS-15 landed before WS-14 since the prep
+call's token budget fix mattered for the SKIP gate. Two deviations worth a permanent note here
+(full detail in the WS-16 commit message): the `thinking` parameter shape in the WS-15 spec
+(`{"type": "enabled", "budget_tokens": N}`) is rejected with a 400 by the live API for
+`claude-sonnet-5` — that shape was removed for this model family after this plan was written;
+used `{"type": "adaptive"}` instead. And WS-16's bulk-collection reindex moved 7,197 rows, not the
+7,127 Felix's review counted — a second spreadsheet (`Pagrin ROI Model - DFS.xlsx`, 70 rows) was
+ingested after that review and matches the same selection criteria. All six workstreams' acceptance
+checklists were verified live against the production box (real API calls, real `dot.db`, a real
+restore rehearsal), not just read against the code.

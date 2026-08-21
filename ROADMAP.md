@@ -2,23 +2,15 @@
 
 ## Planned
 
-**Phase 0 — correctness gate, before the two-week trial.** See `docs/IMPLEMENTATION_PLAN.md`
-(2026-08-20 evening review, WS-14 to WS-19). Nothing here adds a feature; every item removes a wrong
-output, prevents silent data loss, or captures evidence.
+**Phase 1 — deferred until the two-week trial reports.** Phase 0 (below, shipped 2026-08-21) closed
+the correctness gate; nothing in Phase 1 starts until the trial's `feedback` table (via `/wrong`)
+says what actually matters. Full list and promotion triggers in `docs/IMPLEMENTATION_PLAN.md`'s
+Phase 1 table: the deal-pipeline decision (use it, redesign it, or remove it — a product question,
+not a bug), removing the now-dead `get_stale_deals`, a general test suite (only after WS-19 proves
+the pattern), morning briefing v2 and reminders v2 (only if Joey misses them), and ingestion tuning
+(only if `/wrong` points at document reads).
 
-- **WS-14** — Meeting prep fires only on real, timed, external meetings, and "stop prepping this"
-  actually stops it (persistent mute table + tool). Fixes the Aug 7 failure that ended usage.
-- **WS-15** — Explicit `thinking` parameter and adequate token budgets on every one-shot Claude
-  call; a truncated or thinking-only response can no longer pass as a valid empty result.
-- **WS-16** — Relevance floor on memory retrieval; the 7,127-row Africa Big Deal spreadsheet moves
-  behind an explicit search tool instead of being injected on every turn.
-- **WS-17** — `doc_cache` stores the full parse instead of the 15,000-char ingest truncation.
-- **WS-18** — Nightly backups of `dot.db` + `sessions/`, honest API-outage alerts, and a `/wrong`
-  command to log bad outputs during the trial.
-- **WS-19** — A narrow test file covering only the above.
-
-**Then: two weeks of use with no development.** Phase 1 is written from what the trial reports, not
-from a backlog.
+**Until then: two weeks of use with no development.**
 
 ---
 
@@ -44,6 +36,43 @@ web search) was removed, along with the "Stale deal alerts in morning briefing" 
 ---
 
 ## Shipped
+
+### Phase 0 correctness gate ✓ — 2026-08-21 (WS-14 to WS-19)
+
+Six workstreams, planned in `docs/IMPLEMENTATION_PLAN.md`'s 2026-08-20 evening review (findings
+F-29 to F-41) and shipped as one commit each. Nothing here is a new feature — every item removes a
+wrong output, prevents silent data loss, or captures evidence, per that review's explicit Phase-0
+rule. The trigger was Joey stopping use on Aug 7 after telling Dot three times to stop prepping a
+personal event and being told "noted" each time while it kept firing anyway.
+
+- **WS-14** — Meeting prep now fires only on real, timed, external meetings: a real
+  "starts-within-window" check (Google Calendar's `timeMin`/`timeMax` is an overlap filter, not a
+  starts-within filter — an all-day event previously matched every 5-minute tick for its whole
+  duration), a persistent `prep_mutes` table + `mute_meeting_prep` tool so "stop prepping X" actually
+  sticks and survives restarts, and an output-side SKIP gate where the prep call itself can decline
+  to send and auto-mute the event. This is the fix for the Aug 7 failure — verified live: the model
+  now calls `mute_meeting_prep` in the same turn Joey says to stop, and a personal-event prompt gets
+  back exactly `SKIP`.
+- **WS-15** — Explicit `thinking` parameter on every one-shot Claude call (adaptive for the
+  interactive main-loop and prep calls, disabled for pure extraction) plus real headroom in
+  `max_tokens`, so reasoning can no longer squeeze out the visible answer. A truncated or
+  thinking-only response now logs loudly (`response_text_checked`) instead of silently producing
+  zero facts or wiping conversation history.
+- **WS-16** — A relevance floor on memory retrieval (measured live: conversational/instructional
+  turns like "ok thanks" used to inject the full top-15 regardless of fit; now inject nothing), plus
+  a separate `bulk_records` Chroma collection for tabular spreadsheet rows (7,197 rows across two
+  files, not passively injected) reachable via a new `search_deal_database` tool.
+- **WS-17** — `doc_cache` now stores the complete document parse instead of the old 15,000-char
+  ingest truncation, so the paging marker on long documents works again. Backfilled the 16 rows that
+  were stuck at exactly 15,000 chars (one grew to 250,206).
+- **WS-18** — Daily WAL-safe backups of `dot.db` + `sessions/` (offsite copy to Dropbox), tested with
+  a real backup run and a real restore rehearsal into a scratch directory; an outage-scoped alert so
+  a credit/auth failure DMs once instead of the 320-calls/zero-messages pattern from mid-August; and
+  `/wrong` for logging bad outputs during the trial (no API call, so it works even when credits are
+  out).
+- **WS-19** — `tests/test_gate.py` (`venv/bin/python -m pytest tests/ -q`) — the repo's first test
+  file, covering only the Phase-0 logic above: event classification, mute matching, the relevance
+  floor, empty-response detection, and the paging-marker formula. 15 tests, all passing.
 
 ### Document read cache + verbatim deck reads ✓ — 2026-08-20 (WS-10 to WS-13)
 

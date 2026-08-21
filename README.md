@@ -312,6 +312,15 @@ Both files are copied to `backups/` (gitignored, retaining the newest 14 of each
 
 The agent's persona, priorities, and tool-routing heuristics live in `BASE_SYSTEM` in `agent.py`, and the fact-extraction behaviour in `EXTRACTION_SYSTEM` in `ingest.py`. Both are written for an Africa-focused investor workflow — edit them to fit yours.
 
+## Tests
+
+`tests/test_gate.py` covers the pure-function logic behind the Phase 0 correctness fixes — meeting-prep event classification and mute matching, the memory relevance floor, empty-response detection, and the document-paging formula. No network calls, no live API key needed, no CI. Install the dev dependency and run:
+
+```bash
+venv/bin/pip install pytest
+venv/bin/python -m pytest tests/ -q
+```
+
 ## Development workflow (Claude Code agents)
 
 Development on this repo uses two Claude Code subagents, defined in `.claude/agents/` and picked up automatically by any Claude Code session opened in this directory — no per-machine setup needed.
