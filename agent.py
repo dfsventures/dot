@@ -52,6 +52,7 @@ from memory import (
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
     was_prepped, mark_prepped, add_prep_mute, list_prep_mutes, delete_prep_mute, is_prep_muted,
+    save_feedback,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -1287,6 +1288,20 @@ async def cmd_log(update, context):
     except Exception as e:
         await update.message.reply_text(f"Log error: {e}")
 
+async def cmd_wrong(update, context):
+    """WS-18C — the trial's evidence log. Reply to any Dot message with /wrong [reason]
+    to record it. No API call, so this keeps working even when credits are out — exactly
+    when Joey most wants to record that something is broken."""
+    if update.effective_user.id != YOUR_USER_ID: return
+    reply_to = update.message.reply_to_message
+    quoted = reply_to.text if reply_to and reply_to.text else ""
+    reason = " ".join(context.args)
+    try:
+        await asyncio.to_thread(save_feedback, quoted, reason)
+        await update.message.reply_text("Logged.")
+    except Exception as e:
+        await update.message.reply_text(f"Feedback log error: {e}")
+
 async def cmd_restart(update, context):
     if update.effective_user.id != YOUR_USER_ID: return
     import subprocess
@@ -1385,6 +1400,26 @@ async def _notify_owner(context, text: str):
         await context.bot.send_message(chat_id=YOUR_USER_ID, text=text[:4000])
     except Exception:
         logging.exception("Failed to notify owner")
+
+# WS-18B (F-37): the credit-balance outage on Aug 12-20 produced one misleading "will
+# retry" DM then 911 silent failures over 9 days. This counter is scoped to permanent
+# (credit/auth) failures specifically — one DM for the whole outage, not one per event
+# per tick — reset on the next success so the next outage gets its own alert.
+_consecutive_api_failures = 0
+
+async def _note_api_failure(context, error_msg: str):
+    global _consecutive_api_failures
+    _consecutive_api_failures += 1
+    if _consecutive_api_failures == 1:
+        await _notify_owner(
+            context,
+            f"⚠️ Dot can't reach the Claude API — {error_msg[:300]}. "
+            f"Nothing will work until this is resolved. I won't message again about this."
+        )
+
+def _note_api_success():
+    global _consecutive_api_failures
+    _consecutive_api_failures = 0
 
 async def error_handler(update, context):
     logging.error(f"Exception: {context.error}")
@@ -1518,6 +1553,7 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
                     msgs.append({"role": "user", "content": tool_results})
                 response = await asyncio.to_thread(_prep_call, prep_container_id)
                 prep_container_id = getattr(response, 'container_id', None) or prep_container_id
+            _note_api_success()  # WS-18B: a successful round-trip re-arms the next outage's alert
             text = " ".join(b.text for b in response.content if b.type == "text").strip()
             if text.upper().startswith("SKIP"):
                 # Output-side gate (D-10c): the model's own judgment on the Aug 7 evidence was
@@ -1534,17 +1570,15 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
                 _prep_notified.discard(event_id)
         except Exception as e:
             logging.error(f"Meeting prep error for '{title}': {e}")
-            if event_id not in _prep_notified:
+            msg = str(e)
+            if "credit balance" in msg or "authentication" in msg.lower():
+                # WS-18B (F-37): permanent/outage-class failure — one DM for the whole
+                # outage via the global counter, not one per event per tick (that's what
+                # produced 320 failed calls / 0 messages on Aug 15).
+                await _note_api_failure(context, msg)
+            elif event_id not in _prep_notified:
                 _prep_notified.add(event_id)
-                msg = str(e)
-                if "credit balance" in msg or "authentication" in msg.lower():
-                    await _notify_owner(
-                        context,
-                        f"⚠️ Dot can't reach the Claude API: {msg[:300]}\n"
-                        f"Prep for '{title}' was skipped and will keep failing until this is resolved."
-                    )
-                else:
-                    await _notify_owner(context, f"⚠️ Couldn't prep '{title}': {msg[:300]} — will retry.")
+                await _notify_owner(context, f"⚠️ Couldn't prep '{title}': {msg[:300]} — will retry.")
         finally:
             _prepping_now.discard(event_id)
 
@@ -1565,6 +1599,7 @@ async def _post_init(app):
         BotCommand("search",     "Search long-term memory"),
         BotCommand("mutes",      "List meeting-prep mutes"),
         BotCommand("unmute",     "Remove a meeting-prep mute by number"),
+        BotCommand("wrong",      "Reply to a Dot message to log it as wrong"),
     ])
 
 def main():
@@ -1583,6 +1618,7 @@ def main():
     app.add_handler(CommandHandler("unmute",     cmd_unmute))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(CommandHandler("log",        cmd_log))
+    app.add_handler(CommandHandler("wrong",      cmd_wrong))
     app.add_handler(CommandHandler("search",     cmd_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))

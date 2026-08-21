@@ -14,9 +14,11 @@ session.json.*
 sessions/
 chroma_db/
 chroma_db.corrupt/
+backups/
 
 # Runtime artifacts
 ingest.log
+backup.log
 .ingest.lock
 __pycache__/
 *.pyc

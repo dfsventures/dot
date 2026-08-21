@@ -47,7 +47,10 @@ Four modules:
 | `web_search` | Anthropic's native server-side web search |
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
 | `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
+| `mute_meeting_prep` / `list_meeting_prep_mutes` / `unmute_meeting_prep` | Persistently stop (or resume) automatic pre-meeting prep briefs for a meeting or a category of meeting — a fact-based instruction like "stop prepping personal events" actually sticks, restart-proof |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |
+
+**Automatic meeting prep:** every 5 minutes, Dot checks for timed (not all-day), external (non-`@dfslab.net`/`@dfs.vc` attendee) meetings starting in ~25-35 minutes and sends a prep brief pulled from Granola, Gmail, Dropbox, and Drive. Before sending, the model itself judges whether the event is really a business meeting — a personal appointment, travel block, or hold gets silently skipped and auto-muted rather than prepped. Say "stop prepping X" (or a category, like personal events) in chat and it's muted immediately and permanently — auditable and reversible via `/mutes` and `/unmute`.
 
 Image-based PDFs (scanned or exported-as-images decks, no text layer) are readable end to end. Decks ingested via Dropbox `/Dot Dump` get a full markdown transcription at ingest time, cached and served instantly on later reads. A deck that was *never* ingested — most of Joey's Dropbox, and all of Drive, since Drive files are never ingested — is transcribed live by Claude on the first `read_dropbox_file`/`read_drive_file` call that hits it (20–60 seconds, ~$0.10–0.20, gated to PDFs under the existing 24 MB/100-page caps) and cached from then on, so every file is at most one slow read away from being fully readable. A PDF that's too large or has too many pages still returns the explicit "no text layer" marker instead of an error or blank text.
 
@@ -65,6 +68,9 @@ Plus Telegram commands (type `/` to see the full menu in the chat):
 - `/forget_procedure <n>` — delete a procedure by number
 - `/newsession` — clear the current conversation (after auto-extracting facts worth keeping)
 - `/log <text>` — extract and save facts from a pasted note or WhatsApp conversation
+- `/mutes` — list active meeting-prep mutes
+- `/unmute <n>` — remove a meeting-prep mute by number
+- `/wrong [reason]` — reply to any Dot message with this to log it as wrong, with an optional reason; makes no API call, so it works even when credits are out
 
 **Telegram reply context:** when you use Telegram's reply feature on a specific message, the quoted message text is automatically prepended to your input so Dot knows what you're referencing.
 
@@ -275,6 +281,31 @@ And schedule ingestion with cron:
 ```
 
 Drop files into the `/Dot Dump` folder in Dropbox; within 15 minutes their facts are in memory and the file moves to `/Dot Dump/Processed`.
+
+Also schedule the daily backup:
+
+```cron
+0 3 * * * /path/to/dot/backup.sh >> /path/to/dot/backup.log 2>&1
+```
+
+## Backups & restore
+
+All state is gitignored, on a single disk with no RAID or snapshots — `chroma_db.corrupt/` (created 2026-06-10 and since removed) is standing proof this store has already been lost once. `backup.sh` runs daily via cron and backs up only the irreplaceable set:
+
+- **`dot.db`** — via SQLite's `.backup()` API, not `cp`. This is WAL-safe (doesn't block the running bot, and can't copy a torn/inconsistent file mid-write) in a way a plain file copy is not.
+- **`sessions/`** — tarred as-is.
+
+**`chroma_db/` (the vector index) is deliberately not backed up.** It's fully derivable from `dot.db` via `migrate_sqlite_to_chroma()` (`memory.py`) using the free local embedding model — that's what keeps the backup at roughly the size of `dot.db` instead of `dot.db` plus the much larger vector index, and it's why the offsite copy below costs nothing extra.
+
+Both files are copied to `backups/` (gitignored, retaining the newest 14 of each — roughly two weeks) and then uploaded to Dropbox `/Dot Backups/` via the same already-authenticated Dropbox app the bot and ingestion already use (`backup_offsite.py`) — no new dependency, no new account, no new cost line. `/Dot Backups/` is never scanned by `ingest.py` (which only watches `/Dot Dump`), so backup files can never be mistaken for a document to ingest.
+
+**Restore:**
+
+1. Copy the newest `backups/dot-<stamp>.db` (or the Dropbox copy) back to `dot.db`.
+2. Delete `chroma_db/`.
+3. Start the bot — `migrate_sqlite_to_chroma()` runs on startup and rebuilds the vector index from `dot.db` automatically.
+
+**Test this before you need it.** An untested backup is not a backup. Rehearse the restore into a scratch directory: copy `memory.py` and a backup `dot.db` in, run `python -c "import memory; memory.migrate_sqlite_to_chroma()"`, then confirm `memory.retrieve_relevant_memories("<something you know is in there>")` returns results.
 
 ## Customising
 

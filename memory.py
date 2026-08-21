@@ -82,6 +82,12 @@ conn.executescript("""
         reason     TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS feedback (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        quoted_text  TEXT DEFAULT '',
+        reason       TEXT DEFAULT '',
+        created_at   TEXT DEFAULT (datetime('now'))
+    );
 """)
 conn.commit()
 
@@ -182,6 +188,15 @@ def is_prep_muted(event_id: str, title: str) -> bool:
         if p == event_id.lower() or (len(p) >= 3 and p in t):
             return True
     return False
+
+def save_feedback(quoted_text: str, reason: str = ""):
+    """WS-18C: the trial's evidence log. No embedding, no Chroma write — this must keep
+    working even when credits are out, which is precisely when Joey most wants to record
+    that something is broken."""
+    conn.execute(
+        "INSERT INTO feedback (quoted_text, reason) VALUES (?, ?)", (quoted_text, reason)
+    )
+    conn.commit()
 
 def delete_memory(content: str) -> bool:
     """Delete a memory from SQLite AND ChromaDB. Returns True if found."""
