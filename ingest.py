@@ -86,6 +86,11 @@ def prior_fact_count(filename: str) -> int:
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────────────────
 def extract_text(content: bytes, filename: str) -> str:
+    """Returns the complete parse — no truncation. Truncating (e.g. to fit a Claude
+    call's context) is the caller's job; see extract_facts_with_claude call sites, which
+    slice independently. (F-36: this function used to cap every format at 15,000 chars,
+    which meant doc_cache — populated straight from this return value — silently stored a
+    truncated document forever, with no way for a later paged read to detect the gap.)"""
     name = filename.lower()
 
     if name.endswith('.pdf'):
@@ -97,7 +102,7 @@ def extract_text(content: bytes, filename: str) -> str:
                 text = page.extract_text()
                 if text:
                     pages.append(text)
-            return "\n".join(pages)[:15000]
+            return "\n".join(pages)
         except Exception as e:
             return f"[PDF extraction error: {e}]"
 
@@ -105,7 +110,7 @@ def extract_text(content: bytes, filename: str) -> str:
         try:
             from docx import Document
             doc = Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())[:15000]
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except Exception as e:
             return f"[DOCX extraction error: {e}]"
 
@@ -127,7 +132,7 @@ def extract_text(content: bytes, filename: str) -> str:
                 if texts:
                     # No leading '[' — callers treat text starting with '[' as an error marker
                     slides.append(f"--- Slide {i} ---\n" + "\n".join(texts))
-            return "\n\n".join(slides)[:15000]
+            return "\n\n".join(slides)
         except Exception as e:
             return f"[PPTX extraction error: {e}]"
 
@@ -146,7 +151,7 @@ def extract_text(content: bytes, filename: str) -> str:
                         break
                 if rows:
                     sheets.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows))
-            return "\n\n".join(sheets)[:15000]
+            return "\n\n".join(sheets)
         except Exception as e:
             return f"[XLSX extraction error: {e}]"
 
@@ -156,12 +161,12 @@ def extract_text(content: bytes, filename: str) -> str:
             text = content.decode('utf-8', errors='ignore')
             reader = csv.reader(text.splitlines())
             rows = ["\t".join(row) for row in reader if any(row)]
-            return "\n".join(rows)[:15000]
+            return "\n".join(rows)
         except Exception as e:
             return f"[CSV extraction error: {e}]"
 
     elif name.endswith(('.txt', '.md')):
-        return content.decode('utf-8', errors='ignore')[:15000]
+        return content.decode('utf-8', errors='ignore')
 
     else:
         return ""
@@ -608,8 +613,11 @@ def run():
                     print(f"  Extracted {len(text):,} chars of text")
                     # Cache the full parse for free re-reads later (WS-11). Keyed on the
                     # Dropbox file id + content_hash — both survive the Processed/ move below.
+                    # extract_text() no longer truncates (F-36/WS-17) — the cache gets the
+                    # complete parse. The Claude extraction call still slices to 15,000
+                    # chars, same as it always effectively did.
                     save_cached_doc("dropbox", entry.id, entry.content_hash, entry.name, text)
-                    facts = extract_facts_with_claude(text, entry.name)
+                    facts = extract_facts_with_claude(text[:15000], entry.name)
                     if not facts:
                         print(f"  No facts extracted from text. Moving to Failed.")
                         move_file(entry.path_display, FAILED_FOLDER, entry.name)
