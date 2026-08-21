@@ -46,6 +46,7 @@ Four modules:
 | `search_drive` / `read_drive_file` | Find and read Google Drive files (Google Docs/Sheets/Slides exported as text, plus PDF, DOCX, TXT, MD, CSV) — read-only |
 | `web_search` | Anthropic's native server-side web search |
 | `update_deal` / `get_deal_info` / `list_deals` | Lightweight deal pipeline: sourcing → first_call → due_diligence → passed / invested |
+| `search_deal_database` | Search the Africa Big Deal database — 7,000+ historical African startup funding rows, kept in its own vector collection rather than passively injected into every turn |
 | `save_procedure` | Saves a reusable HOW-TO (not a fact) when Dot works out a non-obvious multi-step approach — recalled via `<relevant_procedures>` the next time a similar situation comes up |
 | `mute_meeting_prep` / `list_meeting_prep_mutes` / `unmute_meeting_prep` | Persistently stop (or resume) automatic pre-meeting prep briefs for a meeting or a category of meeting — a fact-based instruction like "stop prepping personal events" actually sticks, restart-proof |
 | Voice messages | Send a voice note; Whisper transcribes it locally (CPU, no API cost) and passes the text to the agent |

@@ -53,7 +53,7 @@ PROCESSED_FOLDER = "/Dot Dump/Processed"
 FAILED_FOLDER    = "/Dot Dump/Failed"
 
 # ── MEMORY (shared with agent.py) ─────────────────────────────────────────────
-from memory import conn, save_memory, parse_json_array, list_deals, save_cached_doc, response_text
+from memory import conn, save_memory, save_bulk_record, parse_json_array, list_deals, save_cached_doc, response_text
 
 def _find_deal_match(fact: str, deal_names: list) -> str | None:
     """Return the first active deal company name found in the fact, or None."""
@@ -423,13 +423,16 @@ def ingest_structured_xlsx(content: bytes, filename: str) -> int:
             print(f"  Sheet '{sheet_name}': {len(data_rows)} rows → {len(facts)} facts via Claude")
             continue
 
-        # Large sheet — row by row
+        # Large sheet — row by row. D-11: bulk tabular rows go into their own Chroma
+        # collection (search_deal_database), not the passively-injected memories one —
+        # the SQLite memories row is identical either way (save_bulk_record writes the
+        # same table save_memory does).
         print(f"  Sheet '{sheet_name}': {len(data_rows)} rows → row-by-row ingestion")
         sheet_saved = 0
         for row in data_rows:
             memory = row_to_memory(headers, row, filename)
             if memory and len(memory) > 20:
-                save_memory(memory, tags=tag)
+                save_bulk_record(memory, tags=tag)
                 sheet_saved += 1
         conn.commit()
         print(f"    Saved {sheet_saved} memories")
@@ -460,14 +463,14 @@ def ingest_structured_csv(content: bytes, filename: str) -> int:
         print(f"  CSV: {len(reader)} rows → {len(facts)} facts via Claude")
         return len(facts)
 
-    # Large — row by row
+    # Large — row by row (D-11: bulk collection, see the xlsx path above for rationale)
     print(f"  CSV: {len(reader)} rows → row-by-row ingestion")
     saved = 0
     for row in reader:
         parts = [f"{k}: {v}" for k, v in row.items() if v and str(v).strip()]
         memory = " | ".join(parts)
         if memory and len(memory) > 20:
-            save_memory(memory, tags=tag)
+            save_bulk_record(memory, tags=tag)
             saved += 1
     conn.commit()
     print(f"  Saved {saved} memories")

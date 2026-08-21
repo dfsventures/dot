@@ -52,7 +52,7 @@ from memory import (
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
     was_prepped, mark_prepped, add_prep_mute, list_prep_mutes, delete_prep_mute, is_prep_muted,
-    save_feedback,
+    save_feedback, search_bulk_records,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -490,6 +490,12 @@ def search_memory(query: str) -> str:
         return "No memories found matching that query."
     return "\n".join(f"• {m}" for m in results)
 
+def search_deal_database(query: str, max_results: int = 10) -> str:
+    results = search_bulk_records(query, k=max_results)
+    if not results:
+        return "No matching rows found in the deal database."
+    return "\n".join(f"• {r}" for r in results)
+
 def save_procedure(trigger: str, procedure: str) -> str:
     _save_procedure(trigger, procedure)
     return f"Saved procedure for future '{trigger}' situations."
@@ -796,6 +802,14 @@ TOOLS = [
         }, "required": ["query"]}
     },
     {
+        "name": "search_deal_database",
+        "description": "Search the Africa Big Deal database: 7,000+ historical African startup funding rows (company, round, amount, date, investors). Use for questions about who funded what, when, and for how much. This data is not passively injected — use this tool whenever a question could be about historical funding rounds.",
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "What to search for, e.g. a company name or sector"},
+            "max_results": {"type": "integer", "default": 10}
+        }, "required": ["query"]}
+    },
+    {
         "name": "save_procedure",
         "description": "Save a reusable procedure to long-term memory — HOW you handled something, not a fact about WHAT is true. Call this when you work out a non-obvious multi-step approach that will likely recur (e.g. reconciling a Granola note with a mismatched calendar title, a specific sequence for updating a stale deal). Don't call this for one-off or trivial tasks.",
         "input_schema": {"type": "object", "properties": {
@@ -844,6 +858,7 @@ TOOL_FUNCTIONS = {
     "get_deal_info":        get_deal_info,
     "list_deals":           list_deals,
     "search_memory":        search_memory,
+    "search_deal_database": search_deal_database,
     "save_procedure":       save_procedure,
     "mute_meeting_prep":       mute_meeting_prep,
     "list_meeting_prep_mutes": list_meeting_prep_mutes,
@@ -866,6 +881,7 @@ Your tools and what they contain:
 - web_search: Real-time web search
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something
+- search_deal_database: the Africa Big Deal database — 7,000+ historical African startup funding rows (who raised what, when, from whom). Not passively injected; use this tool for any question about historical funding rounds.
 - save_procedure: save a reusable HOW-TO when you work out a non-obvious multi-step approach likely to recur — not for facts (those are captured automatically) and not for one-off tasks
 - mute_meeting_prep / list_meeting_prep_mutes / unmute_meeting_prep: control automatic pre-meeting prep briefs. If Joey ever says a prep brief was unwanted, wrong, or should stop — for a specific meeting or for a category like personal events — call mute_meeting_prep in that same turn. Do not reply "noted" without calling it; nothing you say is remembered by the prep job unless you write it here.
 If Joey asks to be prepped for a meeting or asks for background on a person or company before a call, proactively search Granola, Gmail, Dropbox, and Drive for context and produce a tight prep brief without being asked to use specific tools.

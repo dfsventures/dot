@@ -96,6 +96,12 @@ _embedder  = SentenceTransformer('all-MiniLM-L6-v2')
 _chroma    = chromadb.PersistentClient(path=CHROMA_PATH)
 _col       = _chroma.get_or_create_collection("memories")
 _proc_col  = _chroma.get_or_create_collection("procedures")
+# D-11 (F-35a): bulk tabular rows (e.g. the Africa Big Deal spreadsheet — 7,127 rows, 66%
+# of the memory store) live in their own collection, excluded from passive per-turn
+# injection and reachable only via the explicit search_deal_database tool. The SQLite
+# `memories` rows are untouched either way — this only changes which Chroma collection a
+# row is indexed into, and Chroma is fully rebuildable from SQLite by design.
+_bulk_col  = _chroma.get_or_create_collection("bulk_records")
 
 def _embed(text: str) -> list:
     return _embedder.encode(text).tolist()
@@ -113,6 +119,41 @@ def save_memory(content: str, tags: str = ""):
         )
     except Exception as e:
         print(f"ChromaDB write error: {e}")
+
+def save_bulk_record(content: str, tags: str = ""):
+    """D-11: identical to save_memory (same SQLite `memories` table, nothing lost or moved
+    there) except indexed into the bulk_records Chroma collection instead of the passively-
+    injected memories collection. For row-by-row structured ingestion (spreadsheets/CSVs)."""
+    cur = conn.execute("INSERT INTO memories (content, tags) VALUES (?, ?)", (content, tags))
+    conn.commit()
+    mem_id = str(cur.lastrowid)
+    try:
+        _bulk_col.add(
+            ids=[mem_id],
+            embeddings=[_embed(content)],
+            documents=[content],
+            metadatas=[{"tags": tags}]
+        )
+    except Exception as e:
+        print(f"ChromaDB bulk write error: {e}")
+
+def search_bulk_records(query: str, k: int = 10) -> list:
+    """Explicit search over the bulk tabular collection (e.g. the Africa Big Deal
+    spreadsheet) — reachable only via the search_deal_database tool, never passively
+    injected. No relevance floor here: an explicit search should return its best matches
+    even if none are a great fit, unlike passive per-turn injection."""
+    try:
+        count = _bulk_col.count()
+        if count == 0:
+            return []
+        results = _bulk_col.query(
+            query_embeddings=[_embed(query)],
+            n_results=min(k, count),
+        )
+        return results["documents"][0] if results["documents"] else []
+    except Exception as e:
+        print(f"ChromaDB bulk query error: {e}")
+        return []
 
 def get_cached_doc(source: str, file_key: str, revision: str) -> str | None:
     """Cached parse for this exact file revision, or None. A revision mismatch is a miss."""
@@ -215,17 +256,34 @@ def get_all_memories() -> list:
     rows = conn.execute("SELECT content FROM memories ORDER BY id DESC").fetchall()
     return [r[0] for r in rows]
 
+# Chroma default space is squared-L2 and sentence-transformers returns unit vectors,
+# so distance d relates to cosine as cos = 1 - d/2. Measured against the live store
+# (2026-08-20): on-topic queries return best d ≈ 0.32-0.59 (cos 0.71-0.84); purely
+# conversational turns ("ok thanks", "stop doing that") bottom out at d ≈ 1.45-1.82
+# (cos 0.28 down to -0.11) and, without a floor, all 15 were injected anyway.
+MEMORY_DISTANCE_MAX = 1.0   # cos >= 0.5
+
 def retrieve_relevant_memories(query: str, k: int = 15) -> list:
-    """Vector similarity search via ChromaDB. Falls back to recency if chroma is empty."""
+    """Vector similarity search via ChromaDB, filtered to a relevance floor (F-35) so
+    conversational/instructional turns with no genuinely relevant memory inject nothing
+    instead of the 15 nearest matches regardless of how far away they are. Falls back to
+    recency if chroma is empty."""
     try:
         count = _col.count()
         if count == 0:
             return get_all_memories()[:k]
         results = _col.query(
             query_embeddings=[_embed(query)],
-            n_results=min(k, count)
+            n_results=min(k, count),
+            include=["documents", "distances"],
         )
-        return results["documents"][0] if results["documents"] else get_all_memories()[:k]
+        docs  = (results.get("documents") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0]
+        if not docs:
+            return get_all_memories()[:k]
+        if not dists:
+            return docs                       # no distances returned — behave exactly as before
+        return [d for d, dist in zip(docs, dists) if dist <= MEMORY_DISTANCE_MAX]
     except Exception as e:
         print(f"ChromaDB query error: {e}")
         return get_all_memories()[:k]
@@ -266,7 +324,9 @@ def delete_procedure(procedure_id: int) -> bool:
     return True
 
 def retrieve_relevant_procedures(query: str, k: int = 3) -> list:
-    """Vector similarity search against procedure triggers via ChromaDB.
+    """Vector similarity search against procedure triggers via ChromaDB, filtered to the
+    same relevance floor as retrieve_relevant_memories (F-35 — this collection has the same
+    defect and will start mattering as soon as procedures is non-empty).
     Returns the procedure text (not the trigger). Falls back to recency if chroma is empty."""
     try:
         count = _proc_col.count()
@@ -275,25 +335,44 @@ def retrieve_relevant_procedures(query: str, k: int = 3) -> list:
         results = _proc_col.query(
             query_embeddings=[_embed(query)],
             n_results=min(k, count),
+            include=["documents", "distances"],
         )
-        if results["ids"] and results["ids"][0]:
-            ids = results["ids"][0]
+        ids   = (results.get("ids") or [[]])[0]
+        docs  = (results.get("documents") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0]
+        if not docs:
+            return []
+        if not dists:
+            survivor_ids, survivor_docs = ids, docs   # no distances returned — behave as before
+        else:
+            pairs = [(i, d) for i, d, dist in zip(ids, docs, dists) if dist <= MEMORY_DISTANCE_MAX]
+            survivor_ids  = [p[0] for p in pairs]
+            survivor_docs = [p[1] for p in pairs]
+        if survivor_ids:
             conn.execute(
                 f"UPDATE procedures SET last_used_at = datetime('now') "
-                f"WHERE id IN ({','.join('?' * len(ids))})",
-                [int(i) for i in ids],
+                f"WHERE id IN ({','.join('?' * len(survivor_ids))})",
+                [int(i) for i in survivor_ids],
             )
             conn.commit()
-        return results["documents"][0] if results["documents"] else []
+        return survivor_docs
     except Exception as e:
         print(f"ChromaDB procedure query error: {e}")
         return [p["procedure"] for p in get_all_procedures()[:k]]
 
 def migrate_sqlite_to_chroma():
     """Sync all existing SQLite memories (and procedures) into ChromaDB.
-    Safe to run multiple times — skips IDs already in ChromaDB."""
+    Safe to run multiple times — skips IDs already in ChromaDB.
+
+    Runs on every bot startup (agent.py), so "already in ChromaDB" must check both
+    `_col` and `_bulk_col` (D-11) — a row deliberately moved to bulk_records is not
+    missing, it's relocated. Checking `_col` alone would silently re-add every
+    bulk-tabular row back into the passively-injected collection on the very next
+    restart, undoing WS-16's reindex within one deploy cycle. Confirmed live: without
+    this check, importing agent.py after the reindex started re-adding the 7,197
+    relocated ids back into `_col`."""
     rows = conn.execute("SELECT id, content, tags FROM memories").fetchall()
-    existing_ids = set(_col.get()["ids"])
+    existing_ids = set(_col.get(include=[])["ids"]) | set(_bulk_col.get(include=[])["ids"])
     to_add = [(str(r[0]), r[1], r[2]) for r in rows if str(r[0]) not in existing_ids]
     if to_add:
         print(f"Migrating {len(to_add)} memories to ChromaDB...")
