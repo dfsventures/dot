@@ -1041,3 +1041,853 @@ WS-10 first — it is an hour, it is decision-independent, and it converts a sil
 visible one. Then WS-11 (needs D-8 for step 5 only; steps 1-4, 6, 7 can land without it). Then WS-12
 (needs D-7). WS-13 last and only if D-9 is a yes. Do not start WS-12 before WS-11 — it has nowhere
 to store a transcription until `doc_cache` exists.
+
+---
+
+# 2026-08-20 (evening) review — why Joey stopped using Dot
+
+Written by Felix. This pass supersedes the framing of the earlier 2026-08-20 review (which was
+scoped to document caching) and folds in its open items. Executor: Alvin. Do not commit — Joey
+handles commits.
+
+## The reframe
+
+The earlier reviews treated Dot's problems as a backlog of independent defects. The evidence says
+otherwise. Reconstructed from the artifacts, not from recollection:
+
+| When | What the evidence shows | Source |
+|---|---|---|
+| Aug 7, 13:48 | Joey: *"Don't send any updates for this meeting again."* | `sessions/default.json` msg 60 |
+| Aug 7, 13:49 | Joey: *"Laide & Asher's Trip"* → Dot: *"Got it — no automated prep messages for Laide & Asher's Trip. noted."* | msgs 62-63 |
+| Aug 7, 16:12 | Prep fires again anyway. Joey replies to it. Dot: *"Got it, sorry about that. No more prep messages for personal calendar events."* | msgs 64-65 |
+| Aug 7, 16:12 | **Last message in the session. Joey never used Dot again.** | `sessions/default.json` mtime |
+| Aug 12, 08:00 | First `credit balance is too low` error — 5 days *after* the last conversation | `journalctl -u dot` |
+| Aug 12 → Aug 20 | **911** credit-balance errors across 9 days | `journalctl -u dot \| grep -c "credit balance"` |
+
+**Credit exhaustion is a consequence, not a cause.** Usage went to zero on Aug 7, five days before
+the first billing error. Every plan item framed as "Dot went quiet because credits ran out" is
+solving the wrong problem. Joey stopped because on Aug 7 he told Dot three times over 2.5 hours to
+stop doing something wrong, was told "noted" three times, and it kept happening. Then he declined to
+refill credits, which is a rational response to a tool you have stopped trusting.
+
+This changes what the plan is for. The goal is not feature completeness. It is: **make every output
+Dot produces either correct or visibly absent, and make it possible for Joey to correct it.**
+
+## Reconciling this plan with "stop building, use it for two weeks"
+
+That advice from the earlier review stands. It is not retracted here, and this plan is not a
+counter-proposal to it. The problem is that the two weeks cannot start today: the exact code path
+that ended the last trial is running in production right now, on a 5-minute timer
+(`agent.py:1463`), unchanged.
+
+So the plan is split by a single test:
+
+> **Phase 0 (gate):** does leaving this unfixed either (a) produce a visibly wrong output during
+> two weeks of ordinary use, (b) silently destroy data, or (c) make the trial's own results
+> unreadable? If yes, it ships before the trial starts.
+>
+> **Phase 1 (deferred):** everything else waits until the trial says whether it matters.
+
+**Hard rule for Phase 0: nothing in it adds a user-facing capability.** Every item removes a wrong
+output, prevents silent data loss, or captures evidence. WS-18's `/wrong` command is the sole
+borderline case and it is included specifically because without it the two weeks produce a vibe
+instead of a finding. Anything that fails this test — a deals workflow, a test suite, briefing v2 —
+is Phase 1 by definition, no matter how appealing.
+
+Phase 0 is ~2 focused days. It is repairing the instrument before taking the measurement, not
+another build cycle.
+
+---
+
+## Findings register (2026-08-20 evening review)
+
+**F-28 — Causality inverted (see table above).** `sessions/default.json` last modified Aug 7 16:12;
+first credit error Aug 12 08:00:01 (the morning-briefing job, which no longer exists). Any
+remediation framed around "credits ran out and Dot went silent" is mis-targeted. Confirms Joey's
+own account: he stopped topping up *because* the output was bad.
+
+**F-29 — Google Calendar's `timeMin`/`timeMax` is an overlap filter, not a "starts within"
+filter.** `check_meeting_prep` (agent.py:1326-1334) queries `timeMin=now+25m`, `timeMax=now+35m` and
+treats every returned event as "starting in ~30 minutes." The API's actual semantics are
+`event.end > timeMin AND event.start < timeMax`. An all-day event (Aug 7-10) therefore matches
+*every* 5-minute tick for its entire multi-day duration. There is no guard anywhere for
+`start.date` (all-day) vs `start.dateTime` (timed) — verified: the string `start` never appears in
+the function. Corroborated in the logs: `'Meet Joey (Pius Bankong)'` and `'Meet Joey (Francis
+Onwumere)'` each hit the prep path 11 consecutive times (55 minutes) on Aug 20.
+
+**F-30 — The "external attendee" filter cannot tell a family member from a founder, and Dot's own
+correct judgment is thrown away.** agent.py:1350-1354 classifies any attendee not on
+`dfslab.net`/`dfs.vc` and not `self` as external. Laide on a personal address scores identically to
+a portfolio founder. Worse, the model *got it right and was ignored*: the captured brief quoted back
+at msg 64 reads *"The picture is now clear. This is a personal calendar event, not a professional
+one."* — and the code sent it anyway, because line 1415 gates only on `if text:`. There is no
+output-side check at all.
+
+**F-31 — The dedup window guarantees re-firing.** `_prepped_events` (agent.py:986) is a plain
+in-memory dict, purged at a 2-hour cutoff (agent.py:1320-1322). Any event overlapping the query
+window for longer than 2 hours is re-prepped roughly every 2 hours, all day. It is also lost
+entirely on restart, so `/restart` re-arms every event.
+
+**F-32 — Structural: there is no code path from anything Joey says in Telegram into
+`check_meeting_prep`.** The function reads the Calendar API and two module-level globals. It reads
+no table, no session, no memory, no procedure. `conversation_history`, `memories`, `procedures` —
+none are consulted. "Got it, noted" was never backed by anything and could not have been. This is
+the root finding: three of the four defects above are ordinary bugs, but this one means *no amount
+of talking to Dot could ever have fixed it.* That is what a user experiences as a system that does
+not listen.
+
+**F-33 — No `thinking` parameter is set anywhere in the codebase.** Verified across all seven
+`client.messages.create` call sites (agent.py:66, 121, 952, 1183, 1391; ingest.py:253, 311, 339).
+The captured briefing output — four full redundant drafts ("Let me compile the confirmed
+stories… Now let me write the final clean output… Here is the formatted morning briefing…") ending
+truncated mid-sentence — is verification reasoning consuming a fixed `max_tokens` budget in the
+visible channel. Note the briefing capture predates the Sonnet 5 upgrade (2a44e3c, Aug 8 11:55),
+which is *after* Joey's last conversation: **this leak is not caused by Sonnet 5's adaptive
+thinking.** Sonnet 5 adds a second, independent squeeze on top, since `max_tokens` caps thinking
+and visible text combined. Current budgets: 600 (`compress_history`), 500 (`cmd_log`), 1000
+(`extract_and_save_memories`), 1000 (`check_meeting_prep` — the only one still live), 4096
+(main loop). The minimum legal `budget_tokens` is 1024
+(`venv/…/anthropic/types/thinking_config_enabled_param.py:15`), i.e. *larger than three of these
+five entire budgets*. Note also that a prompt-level fix has already been tried and demonstrably
+failed: `BASE_SYSTEM` line 825 already says "Never narrate your reasoning or process… Work silently."
+The fix has to be a request parameter, not more prompt.
+
+**F-34 — `response_text()` fixed the crash by converting it into silent data loss.** The helper
+(memory.py:341-344) returns `""` when no text block is present — which is exactly what a
+thinking-only, `max_tokens`-truncated response looks like. Three consumers treat `""` as a valid
+empty result:
+- `extract_and_save_memories` (agent.py:71) → `parse_json_array("")` → `[]` → **no memories saved,
+  no error, no log line.** Fact capture silently stops.
+- `cmd_log` (agent.py:1189) → same → replies `"Logged 0 fact(s):"` as though the note held nothing.
+- `compress_history` (agent.py:126) → `summary = ""` → history is replaced by a literal
+  `"[Earlier conversation summary]\n"` with nothing after it. **Total context loss, no exception.**
+
+Separately, the destructive fallback the earlier brief believed was fixed **is still there**:
+agent.py:139, `except Exception as e: … return recent` — any failure (rate limit, network,
+credit exhaustion) discards all but the last 4 messages. `response_text` removed one *trigger*; it
+did not touch the *failure mode*.
+
+**F-35 — `retrieve_relevant_memories` has no relevance floor, so it injects 15 memories on every
+turn regardless of whether any are relevant.** memory.py:147-160 returns `results["documents"][0]`
+straight from a top-k query; distances are available and discarded. Measured against the live store
+(read-only copy, `all-MiniLM-L6-v2`, normalized embeddings, Chroma default squared-L2, so
+`cos = 1 - d/2`):
+
+| Query | best `d` | spreadsheet rows in top-15 | chars injected |
+|---|---|---|---|
+| `"Don't send any updates for this meeting again."` (the real Aug 7 turn) | 1.382 | **15 / 15** | 16,541 (~4.1k tokens) |
+| `"Laide & Asher's Trip"` | 1.588 | 2 / 15 | 4,360 |
+| `"stop doing that"` | 1.778 | 0 / 15 | — |
+| `"ok thanks"` | 1.451 | 0 / 15 | — |
+| `"What is Kotani Pay raising?"` | 0.318 | 3 / 15 | 4,552 |
+| `"Tell me about Mindjoy"` | 0.493 | — | — |
+
+Genuinely on-topic queries hit `d` ≈ 0.32-0.59 (cos 0.71-0.84). Conversational and instructional
+turns bottom out at `d` ≈ 1.4-1.8 (cos 0.30 to **-0.11**) — and all 15 are injected anyway. This is
+the primary defect; the spreadsheet is an aggravator, not the root. It is also *worst exactly where
+it hurt most*: on the turn where Joey was trying to correct Dot, 100% of injected context was
+Sendchamp/Kasookoo deal rows.
+
+**F-35a — the aggravator, quantified.** 7,127 of 10,779 memories (**66.1%**) carry
+`tags = 'source:2019-2026 Africa The Big Deal_Database_20260604.xlsx'`, averaging 1,033 chars each,
+created by `ingest_structured_xlsx`'s row-by-row path (ingest.py:418-428) which writes one
+`memories` row per spreadsheet row into the same Chroma collection as real facts. This is *tabular
+reference data*, not episodic memory; it should be queryable, not passively injected.
+
+**F-36 — `doc_cache` stores the ingest-truncated parse, and the paging logic cannot detect it.**
+`extract_text` caps every format at 15,000 chars (ingest.py:100, 108, 130, 149, 159, 164) and
+ingest.py:597/608 caches that capped string. WS-11's premise ("the cache stores the full parse") was
+wrong. Live reads then hit `read_dropbox_file`'s marker at agent.py:551 — `if offset + 3000 <
+len(text)` — which at `offset=12000` on a 15,000-char body is false, so **no "more characters"
+marker is emitted and Claude reports the document as fully read.** Confirmed in the live table:
+**16 rows at exactly `char_count = 15000`**, including `'2025 Africa Venture Capital Exit &
+Liquidity Report.pdf'`, `"WiASSUR's Memo.pdf"`, `'Vendease Y Combinator.pdf'`. (The 4 rows above
+15,000 are `kind='vision'` and unaffected — the cap is on the text path only.)
+
+**F-37 — Credit exhaustion produced one *misleading* alert, then 911 silent failures.** Not "no
+alert," as previously believed. On the first failure per event, agent.py:1422-1424 DMs
+`"⚠️ Couldn't prep 'X' — will retry."` — which names neither the cause nor the fact that it is
+unrecoverable, and the words "will retry" imply a transient blip. Every subsequent attempt is
+silent (`_prep_notified` suppresses it). Peak day Aug 15: 320 failed API calls, zero messages.
+
+**F-38 — The `deals` table is empty: `SELECT COUNT(*) FROM deals` → 0.** `update_deal`,
+`get_deal_info`, `list_deals` are advertised in `BASE_SYSTEM` (agent.py:809) and on the roadmap, and
+WS-9/D-5 built `deal:<company>` fact-tagging on top of them, but there has never been a deal to
+match against — so the tagging path in `ingest.py` has been a no-op for every one of the 211
+ingested files. `procedures` is likewise empty (feature added Aug 8, after Joey had already
+stopped). This is a **product** finding, not a bug: Joey has never used the CRM. Do not "fix" it.
+
+**F-39 — Doc drift.** `ROADMAP.md` still lists "Follow-up reminders ✓" (line 33) and "Morning
+briefing ✓" (line 37) plus "Stale deal alerts in morning briefing ✓" (line 53) as shipped, all
+removed in `12cb981`. `README.md` was correctly cleaned by that commit — the drift is ROADMAP-only.
+`get_stale_deals` (memory.py:306) has no callers anywhere (`grep -rn get_stale_deals` returns the
+definition plus one stale plan reference).
+
+**F-40 — No backups.** All state is gitignored (`.gitignore` lines 8-15) on a single
+`nvme0n1` (476.9 GB, no RAID, no snapshots). `chroma_db.corrupt/` (51 MB) is standing proof this
+store has already been lost once. Sizing note that makes this cheap: `chroma_db/` (70 MB) is fully
+*derivable* from `dot.db` via `migrate_sqlite_to_chroma` (memory.py:221-239, free/local
+embeddings), so the irreplaceable set is `dot.db` (9.1 MB) + `sessions/` (0.25 MB) ≈ **9.4 MB**.
+
+**F-41 — Zero tests.** `find . -name 'test*'` outside `venv/` returns nothing.
+
+---
+
+## Product decisions (Joey, 2026-08-21) — all three confirmed per Felix's recommendation
+
+- **D-10 → (c), structural filters + persistent mute + output-side SKIP gate. Confirmed.**
+- **D-11 → (b), relevance floor + separate Chroma collection for the spreadsheet. Confirmed.**
+- **D-12 → yes, add `/wrong`. Confirmed.**
+
+Rationale for each retained below as written during review.
+
+### D-10 — How should meeting prep decide what counts as a real meeting?
+
+The naive fix is a personal-domain denylist (gmail.com, outlook.com, …). **Recommend rejecting it**:
+Joey's founders overwhelmingly use gmail.com, so a denylist would suppress precisely the meetings
+prep exists for. Options actually on the table:
+
+- **(a) Structural filters only** — timed events only (skip all-day), true "starts within window",
+  ≥1 non-internal attendee. Fixes the Laide case (it was all-day) but not a coffee with a friend.
+- **(b) Structural filters + a persistent mute Joey can set by talking to Dot** — same as (a), plus
+  a `prep_mutes` table written by a `mute_meeting_prep` tool, so "stop prepping X" is real.
+- **(c) (b) + an output-side SKIP gate** — the prep prompt must emit `SKIP` as its first token if
+  the event is not a business meeting, and the code drops the brief and auto-mutes the event
+  instead of sending. Costs one already-paid API call; catches what the input filters miss.
+
+**Recommendation: (c).** (a) alone leaves F-32 — the "cannot be told to stop" problem — completely
+unaddressed, which is the thing that actually ended usage. (c) is (b) plus roughly fifteen lines,
+and the Aug 7 evidence shows the model's own judgment was correct and merely discarded.
+
+### D-11 — Where should the Africa Big Deal spreadsheet live?
+
+7,127 rows, 66% of the memory store, injected into passive retrieval (F-35a).
+
+- **(a) Relevance floor only** — add a distance threshold; leave the rows where they are.
+- **(b) Floor + move bulk tabular rows to their own Chroma collection**, reachable through a new
+  `search_deal_database` tool, and excluded from passive injection.
+- **(c) Delete them.** Not recommended and not proposed — this is real data Joey may want, and the
+  scope rules here forbid destructive changes without explicit sign-off.
+
+**Recommendation: (b).** (a) alone gets most of the benefit for a tenth of the work and should ship
+first regardless — but the spreadsheet will keep winning name-shaped queries (Sendchamp beat
+everything on an unrelated turn) because there are simply 7,127 chances for a row to be nearest.
+(b) is additive: the SQLite `memories` rows are never touched, only Chroma collection membership
+changes, and Chroma is rebuildable from SQLite by design.
+
+### D-12 — Should the trial capture structured feedback?
+
+Proposed: a `/wrong` command — reply to any Dot message with `/wrong [reason]` and it appends the
+quoted message, the reason, and a timestamp to a `feedback` table. Zero API cost, ~30 lines.
+
+**Recommendation: yes.** Without it, the two weeks end with an impression. With it, they end with a
+list of the specific outputs Joey didn't trust, which is the only honest input to Phase 1. This is
+the one Phase-0 item that adds a user-facing surface, and it is included for exactly that reason.
+Say no if you'd rather just tell me what went wrong at the end of the fortnight.
+
+---
+
+# PHASE 0 — Gate. Ships before the two-week trial starts.
+
+## WS-14 — Meeting prep: fire only on real meetings, and make "stop" actually work (F-29, F-30, F-31, F-32; D-10)
+
+**Goal:** prep fires once per real, timed, external business meeting, and anything Joey tells Dot to
+stop prepping actually stops. This is the workstream that addresses why usage went to zero.
+
+**Confirmed decisions:** D-10 (pending Joey; steps 1-3 and 5-6 are decision-independent and can
+start immediately — only step 4's mute surface and step 7's SKIP gate depend on the answer).
+
+**Files:** `memory.py`, `agent.py`.
+
+### 1. `memory.py` — two additive tables in the existing `conn.executescript` block (after `doc_cache`)
+
+```sql
+CREATE TABLE IF NOT EXISTS prep_log (
+    event_id     TEXT NOT NULL,
+    occurrence   TEXT NOT NULL DEFAULT '',   -- event start ISO — a recurring series preps per occurrence
+    prepped_at   TEXT DEFAULT (datetime('now')),
+    outcome      TEXT DEFAULT 'sent',        -- 'sent' | 'skipped' | 'muted'
+    PRIMARY KEY (event_id, occurrence)
+);
+CREATE TABLE IF NOT EXISTS prep_mutes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern    TEXT NOT NULL,                -- event id, or a case-insensitive substring of the title
+    reason     TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+```
+
+Both are `CREATE TABLE IF NOT EXISTS`, additive, no migration, no existing table touched.
+
+### 2. `memory.py` — accessors, following the `get_cached_doc`/`save_cached_doc` pattern
+
+```python
+def was_prepped(event_id: str, occurrence: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM prep_log WHERE event_id = ? AND occurrence = ?", (event_id, occurrence)
+    ).fetchone() is not None
+
+def mark_prepped(event_id: str, occurrence: str, outcome: str = "sent"):
+    conn.execute(
+        "INSERT OR REPLACE INTO prep_log (event_id, occurrence, outcome) VALUES (?, ?, ?)",
+        (event_id, occurrence, outcome))
+    conn.commit()
+
+def add_prep_mute(pattern: str, reason: str = "") -> str: ...
+def list_prep_mutes() -> list: ...
+def delete_prep_mute(mute_id: int) -> bool: ...
+
+def is_prep_muted(event_id: str, title: str) -> bool:
+    """True if any mute row matches this event by id or by case-insensitive title substring."""
+    t = (title or "").lower()
+    for (pattern,) in conn.execute("SELECT pattern FROM prep_mutes").fetchall():
+        p = pattern.lower()
+        if p == event_id.lower() or (len(p) >= 3 and p in t):
+            return True
+    return False
+```
+
+`prep_log` replaces `_prepped_events` entirely — delete that global and its 2-hour purge loop
+(agent.py:986, 1320-1322). Persistence also closes the restart-amnesia half of F-31 and F-16.
+Housekeeping: prune `prep_log` rows older than 90 days inside `mark_prepped` — one extra `DELETE`,
+keeps the table from growing without bound.
+
+### 3. `agent.py` — real "starts within the window" filtering (F-29)
+
+Keep the API call as-is (the overlap query is a superset — correct to fetch, wrong to trust), then
+filter client-side inside the `for event in events:` loop, before the attendee check:
+
+```python
+        start = event.get('start', {})
+        if 'dateTime' not in start:
+            continue                      # all-day / date-only event — no "30 minutes before" exists
+        try:
+            start_dt = datetime.fromisoformat(start['dateTime'])
+        except ValueError:
+            continue
+        if not (window_start <= start_dt <= window_end):
+            continue                      # overlapping, but not starting in this window (F-29)
+        occurrence = start_dt.isoformat()
+```
+
+The `from datetime import datetime, timezone, timedelta` at agent.py:1314 already provides
+`datetime`. `fromisoformat` returns an aware datetime for Google's offset-bearing strings, so the
+comparison against the aware `window_start`/`window_end` is safe; the bare `except ValueError:
+continue` matches the codebase's never-raise convention for background work.
+
+### 4. `agent.py` — the mute path, i.e. the fix for F-32
+
+Replace the `_prepped_events` guard at agent.py:1346 with:
+
+```python
+        title = event.get('summary', 'Untitled')
+        if was_prepped(event_id, occurrence) or event_id in _prepping_now:
+            continue
+        if is_prep_muted(event_id, title):
+            mark_prepped(event_id, occurrence, outcome="muted")
+            continue
+```
+
+(`title` moves above the guard from its current position at agent.py:1359.)
+
+Then a tool, registered the same way every other tool is — schema in `TOOLS`, function in
+`TOOL_FUNCTIONS`, one line in `BASE_SYSTEM`'s tool list:
+
+```python
+def mute_meeting_prep(pattern: str, reason: str = "") -> str:
+    """Stop sending automatic prep briefs for a meeting. `pattern` is an event title or a
+    distinctive substring of one. Never raises — returns a string like every other tool."""
+    try:
+        add_prep_mute(pattern, reason)
+        return f"Muted automatic prep briefs for anything matching '{pattern}'. This is persistent."
+    except Exception as e:
+        return f"Mute error: {e}"
+```
+
+`BASE_SYSTEM` addition, in the tool list after `save_procedure`:
+
+> `- mute_meeting_prep / list_meeting_prep_mutes / unmute_meeting_prep`: control automatic pre-meeting
+> prep briefs. **If Joey ever says a prep brief was unwanted, wrong, or should stop — for a specific
+> meeting or for a category like personal events — call `mute_meeting_prep` in that same turn. Do not
+> reply "noted" without calling it; nothing you say is remembered by the prep job unless you write it here.**
+
+That bolded sentence is the literal repair for Aug 7. Add `/mutes` and `/unmute <n>` commands
+mirroring the existing `/procedures` + `/forget_procedure` pair (agent.py:1145-1164) so Joey can
+audit and undo without the model in the loop.
+
+### 5. `agent.py` — mark before sending is already correct; keep it, but record skips too
+
+agent.py:1418 already marks only on a successful send (the WS-8 fix). Preserve that. Additionally
+call `mark_prepped(..., outcome='skipped')` on the SKIP path (step 7) so a skipped event is not
+re-evaluated every 5 minutes for the rest of its duration.
+
+### 6. `agent.py` — honest failure text (pairs with WS-18)
+
+Replace `f"⚠️ Couldn't prep '{title}' — will retry."` (agent.py:1424) with text that names the
+cause, and do not claim a retry when the error is permanent:
+
+```python
+                msg = str(e)
+                if "credit balance" in msg or "authentication" in msg.lower():
+                    await _notify_owner(context, f"⚠️ Dot can't reach the Claude API: {msg[:300]}\nPrep for '{title}' was skipped and will keep failing until this is resolved.")
+                else:
+                    await _notify_owner(context, f"⚠️ Couldn't prep '{title}': {msg[:300]} — will retry.")
+```
+
+### 7. `agent.py` — output-side SKIP gate (D-10 option (c) only)
+
+Append to the prep prompt (after the existing "Start immediately with the brief" line at
+agent.py:1379):
+
+```
+If this is not a business meeting — a personal appointment, a family event, a travel or
+out-of-office block, a focus/hold block, or anything where a prep brief would be unwanted —
+respond with exactly SKIP and nothing else. Do not explain. Do not write a brief anyway.
+```
+
+and gate the send:
+
+```python
+            text = " ".join(b.text for b in response.content if b.type == "text").strip()
+            if text.upper().startswith("SKIP"):
+                mark_prepped(event_id, occurrence, outcome="skipped")
+                add_prep_mute(event_id, reason=f"auto: model judged '{title}' non-business")
+                logging.info(f"Meeting prep: skipped non-business event '{title}'")
+                continue
+            if text:
+                ...
+```
+
+The auto-mute is what stops a 3-day all-day event burning one API call per tick for 3 days.
+
+**Acceptance checklist**
+- [ ] A 3-day all-day event with a personal-gmail attendee produces **zero** prep messages across a
+      full day of ticks (this is the literal Aug 7 regression).
+- [ ] A normal 30-minute external meeting still preps exactly once, ~25-35 min out.
+- [ ] The same meeting preps exactly once even though it matches 2-3 consecutive 5-minute ticks.
+- [ ] A >2-hour external meeting preps exactly once, not once every 2 hours (F-31).
+- [ ] `/restart` mid-day does not re-prep meetings already prepped that morning.
+- [ ] Telling Dot "stop prepping Laide & Asher's Trip" in chat causes a `prep_mutes` row to be
+      written *in that turn*, and the next tick sends nothing. Verify by reading the table, not by
+      trusting the reply.
+- [ ] `/mutes` lists it; `/unmute 1` removes it and prep resumes.
+- [ ] An internal-only (`@dfslab.net`) meeting still produces nothing.
+- [ ] Existing `dot.db` opens unchanged; `memories`, `deals`, `doc_cache` untouched.
+
+**UX impact:** strictly subtractive on the failure side — fewer unwanted messages, no change to
+wanted ones. Additive on the control side: three new tools plus `/mutes` and `/unmute`, none of
+which alter existing behavior. The one visible change is that failure DMs now state the actual
+cause instead of "will retry."
+**Cost impact:** **negative.** Removes every wasted prep API call on all-day and long events — on
+Aug 20 alone, 36 calls were spent on 5 events that should have produced at most 5. Two new SQLite
+tables, ~1 KB. No new services.
+**Effort:** 4-6 hours including the acceptance runs.
+
+---
+
+## WS-15 — Deterministic one-shot calls; no silent empty results (F-33, F-34)
+
+**Goal:** verification reasoning stops leaking into visible output and stops eating the content
+budget; and a truncated or thinking-only response can never be mistaken for a valid empty result.
+
+**Confirmed decisions:** none needed — technical calls, all cheaply reversible (each is a
+one-parameter revert). Flagged as judgment calls below.
+
+**Files:** `agent.py`, `memory.py`.
+
+### 1. Set `thinking` explicitly on every one-shot call
+
+The installed SDK supports both shapes (`thinking_config_disabled_param.py`,
+`thinking_config_enabled_param.py`, `budget_tokens` required ≥1024 and `< max_tokens`).
+
+| Call site | Now | Change to | Why |
+|---|---|---|---|
+| `extract_and_save_memories` agent.py:66 | `max_tokens=1000` | `thinking={"type": "disabled"}`, `max_tokens=1500` | Pure JSON extraction. Thinking is a token tax and a truncation risk with nothing to gain. |
+| `compress_history` agent.py:121 | `max_tokens=600` | `thinking={"type": "disabled"}`, `max_tokens=1500` | Summarisation. 600 tokens for "this replaces the full history" was always too tight. |
+| `cmd_log` agent.py:1183 | `max_tokens=500` | `thinking={"type": "disabled"}`, `max_tokens=1500` | Same as above; 500 is below the 1024 thinking minimum, so adaptive thinking here is a coin-flip. |
+| `check_meeting_prep._prep_call` agent.py:1388 | `max_tokens=1000` | `thinking={"type": "enabled", "budget_tokens": 2000}`, `max_tokens=6000` | **Judgment call.** Prep genuinely benefits from reasoning across Granola/Gmail/Dropbox — the bug was that reasoning had nowhere to go *but* the visible channel. Enabling it with a real budget gives it somewhere to go and leaves ~4,000 for the brief. Reversal: set `{"type": "disabled"}` and `max_tokens=2500`. |
+| `call_claude` agent.py:952 | `max_tokens=4096` | `thinking={"type": "enabled", "budget_tokens": 4000}`, `max_tokens=12000` | **Judgment call.** Under adaptive thinking, a 4096 combined cap can be fully consumed by thinking, in which case `final` at agent.py:1060 falls through to the literal string `"Done."` — Dot answering "Done." to a real question. Reversal: revert both values. |
+| ingest.py:253, 311, 339 | 8000 / 8000 / 2000 | `thinking={"type": "disabled"}` on all three; raise the 2000 to 3000 | Batch extraction/transcription, no interactivity, and F-27 already noted truncation loses real work here. |
+
+### 2. `memory.py` — make an empty result distinguishable from a valid one
+
+`response_text` keeps its signature (six existing call sites depend on it). Add a sibling rather
+than changing it:
+
+```python
+def response_text_checked(response, label: str) -> str:
+    """response_text(), but loud when the model returned no text at all — a thinking-only or
+    max_tokens-truncated response looks identical to a legitimately empty answer (F-34)."""
+    text = response_text(response)
+    if not text.strip():
+        import logging
+        logging.error(
+            f"{label}: no text block in response (stop_reason={getattr(response, 'stop_reason', '?')}) "
+            f"— treating as failure, not as an empty result")
+    return text
+```
+
+Switch `extract_and_save_memories`, `cmd_log`, and `compress_history` to it.
+
+### 3. `agent.py` — stop `compress_history` destroying history (F-34, still live)
+
+Two changes in `compress_history`:
+
+```python
+        summary = response_text_checked(r, "compress_history").strip()
+        if not summary:
+            return conversation                    # no summary → keep everything, never silently truncate
+        ...
+    except Exception as e:
+        logging.error(f"Compression error: {e}")
+        return conversation                        # was: return recent — dropped all but 4 messages
+```
+
+The current `return recent` (agent.py:139) discards the conversation on *any* failure, including the
+credit-exhaustion error that ran 911 times this month. The trade-off is explicit and correct:
+returning `conversation` unchanged risks one oversized request that the API rejects with a clear
+error, versus silently deleting Joey's context. Prefer the loud failure. Also swap the two bare
+`print` calls here for `logging` — this is `agent.py`, where the convention is `logging`
+(the `print` at agent.py:135 is a pre-existing inconsistency).
+
+### 4. `agent.py` — never answer "Done." because the budget ran out
+
+```python
+        final = " ".join(b.text for b in response.content if b.type == "text").strip()
+        if not final:
+            logging.error(f"Empty final response (stop_reason={response.stop_reason})")
+            final = ("I hit my output limit before I could answer — the reasoning consumed the "
+                     "budget. Ask again, more narrowly." if response.stop_reason == "max_tokens"
+                     else "Done.")
+```
+
+**Acceptance checklist**
+- [ ] `grep -n "messages.create" agent.py ingest.py` — every call site has an explicit `thinking`.
+- [ ] A prep brief for a real meeting arrives complete, with no "Let me…"/"Now let me…" narration
+      and no mid-sentence truncation. Compare against the captured four-draft briefing output.
+- [ ] Force `stop_reason == "max_tokens"` (temporarily set `max_tokens=1200` with
+      `budget_tokens=1024`); confirm an `ERROR` log line appears rather than a silent `[]`.
+- [ ] Force an exception inside `compress_history` (e.g. bad model name); confirm the returned list
+      length equals the input length and history is intact on disk.
+- [ ] `/log` on a paragraph with 3 clear facts saves 3 memories, not 0.
+
+**UX impact:** additive/invisible. Existing correct answers are unchanged; truncated and
+reasoning-leaked answers become correct. One new visible string, on a path that currently emits the
+actively misleading `"Done."`.
+**Cost impact:** modest increase, bounded and worth naming honestly. `max_tokens` is a ceiling, not
+a charge — cost rises only for responses that actually use the headroom. Rough worst case on the
+main loop: +8k output tokens on a turn that genuinely needs them. Disabling thinking on the four
+extraction calls is a straight *reduction*. No new services.
+**Effort:** 2-3 hours.
+
+---
+
+## WS-16 — Put a relevance floor on memory retrieval (F-35, F-35a; D-11)
+
+**Goal:** Dot stops injecting ~4,000 tokens of irrelevant context into every conversational turn.
+Cheapest, highest-leverage item in the plan: step 1 is roughly five lines.
+
+**Confirmed decisions:** D-11 (pending). Step 1 is decision-independent — ship it regardless.
+Steps 2-4 are D-11 option (b) only.
+
+**Files:** `memory.py`, `agent.py`.
+
+### 1. Distance threshold in `retrieve_relevant_memories` (memory.py:147)
+
+```python
+# Chroma default space is squared-L2 and sentence-transformers returns unit vectors,
+# so distance d relates to cosine as cos = 1 - d/2. Measured against the live store
+# (2026-08-20): on-topic queries return best d ≈ 0.32-0.59 (cos 0.71-0.84); purely
+# conversational turns ("ok thanks", "stop doing that") bottom out at d ≈ 1.45-1.82
+# (cos 0.28 down to -0.11) and, without a floor, all 15 were injected anyway.
+MEMORY_DISTANCE_MAX = 1.0   # cos >= 0.5
+
+def retrieve_relevant_memories(query: str, k: int = 15) -> list:
+    try:
+        count = _col.count()
+        if count == 0:
+            return get_all_memories()[:k]
+        results = _col.query(
+            query_embeddings=[_embed(query)],
+            n_results=min(k, count),
+            include=["documents", "distances"],
+        )
+        docs  = (results.get("documents") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0]
+        if not docs:
+            return get_all_memories()[:k]
+        if not dists:
+            return docs                       # no distances returned — behave exactly as before
+        return [d for d, dist in zip(docs, dists) if dist <= MEMORY_DISTANCE_MAX]
+    except Exception as e:
+        print(f"ChromaDB query error: {e}")
+        return get_all_memories()[:k]
+```
+
+`build_user_content` (agent.py:842-845) already handles an empty list by omitting the
+`<relevant_memories>` block entirely, so no caller change is needed. Apply the identical treatment
+to `retrieve_relevant_procedures` (memory.py:197), which has the same defect and will start
+mattering as soon as `procedures` is non-empty.
+
+Against the measured queries this yields: `"Kotani Pay raising"` → 15 kept; `"Tell me about
+Mindjoy"` → ~9; `"Mainstack"` → ~5; `"ok thanks"`, `"stop doing that"`, and the real
+`"Don't send any updates for this meeting again."` → **0**.
+
+### 2-4. (D-11 option (b) only) Separate the bulk tabular rows
+
+2. `memory.py`: add `_bulk_col = _chroma.get_or_create_collection("bulk_records")`.
+3. `ingest.py`: in the two row-by-row paths (`ingest_structured_xlsx` line 421-425,
+   `ingest_structured_csv` line 458-463), call a new `save_bulk_record(...)` that writes the SQLite
+   `memories` row exactly as today (nothing is lost or moved in SQLite) but indexes into
+   `_bulk_col`. Small-sheet Claude-extracted facts keep going to `_col` — they are real facts.
+4. `agent.py`: new `search_deal_database(query, max_results=10)` tool over `_bulk_col`, registered
+   in `TOOLS`/`TOOL_FUNCTIONS`/`BASE_SYSTEM` — "the Africa Big Deal database: 7,000+ historical
+   African startup funding rows. Use for questions about who funded what, when, and for how much."
+
+One-time reindex, run manually, **read-only against SQLite**: delete the 7,127 ids with
+`tags LIKE 'source:%.xlsx'` / `'source:%.csv'` and row-shaped content from `_col`, add them to
+`_bulk_col`. Reversible by rerunning `migrate_sqlite_to_chroma`. Run it *after* WS-18's backup job
+exists, not before.
+
+**Acceptance checklist**
+- [ ] Turn with text "ok thanks" produces no `<relevant_memories>` block (inspect
+      `sessions/default.json` after the turn).
+- [ ] "Don't send any updates for this meeting again." produces no `<relevant_memories>` block.
+- [ ] "What is Kotani Pay raising?" still returns the same top facts it does today.
+- [ ] `SELECT COUNT(*) FROM memories` is still 10,779 after the reindex — SQLite untouched.
+- [ ] `search_deal_database('Sendchamp')` returns the three Sendchamp rows.
+- [ ] Rerunning `migrate_sqlite_to_chroma()` restores prior behavior (documented rollback).
+
+**UX impact:** the change Joey is most likely to *feel*. Answers stop being preceded by unrelated
+deal rows; no capability is removed — the spreadsheet becomes reachable by an explicit tool rather
+than by accident. Risk to name: a query whose only good match sits at d ≈ 1.05 now returns nothing
+instead of a weak match. Mitigation: `search_memory` already exists as the explicit escape hatch and
+is already described in `BASE_SYSTEM` (agent.py:810). Reversal is one constant.
+**Cost impact:** **negative.** Removes up to ~4.1k input tokens per turn (measured, worst case).
+Embeddings are local and free; the extra Chroma collection is disk only.
+**Effort:** 1 hour for step 1; 2-3 hours for steps 2-4 plus the reindex.
+
+---
+
+## WS-17 — Cache the full parse, not the truncated one (F-36)
+
+**Goal:** a cached document read never silently ends at 15,000 characters while reporting itself
+complete. Corrects the WS-11 premise.
+
+**Confirmed decisions:** none needed — this restores intended behavior.
+
+**Files:** `ingest.py`, plus a one-off backfill script (scratch, not committed).
+
+### 1. Move the 15,000 cap from the parser to the fact-extraction call sites
+
+`extract_text` (ingest.py:88) returns the full parse; drop `[:15000]` from all six returns
+(lines 100, 108, 130, 149, 159, 164). The Claude-facing call sites already slice independently —
+ingest.py:411 and 449 both pass `text[:15000]` — so only the direct `extract_facts_with_claude(text,
+…)` calls in the main ingest loop need `text[:15000]` added. Update `extract_text`'s docstring to
+say it returns the complete parse and that truncation is the caller's job.
+
+Memory note: the largest observed parse is ~250,000 chars (F-24). `read_only=True` on the openpyxl
+loader and the existing per-file loop mean this is a transient string, not a leak. Acceptable.
+
+### 2. `read_dropbox_file` / `read_drive_file` — no change needed
+
+Once the cache holds the full text, `if offset + 3000 < len(text)` is correct again and the paging
+marker reappears on long documents. Verified by reading agent.py:550-553 and 609-612; the bug was
+always upstream.
+
+### 3. One-off backfill of the 16 truncated rows
+
+Scratch script (`/tmp/.../scratchpad/`, not in the working tree, per scope rules): select
+`file_key, source, filename FROM doc_cache WHERE char_count = 15000`, re-download each from Dropbox,
+re-parse with the fixed `extract_text`, and `save_cached_doc(...)` — which already does
+`ON CONFLICT … DO UPDATE` (memory.py:121-123), so this is an in-place refresh, not a delete. 16
+files, no Claude calls (all `kind='text'`), a few minutes of Dropbox bandwidth.
+
+Do **not** use `char_count >= 15000` as the selector — that picks up the 4 `kind='vision'` rows
+(`Merge Deck (1).pdf` 23,337; `Loubby` 18,650; `Sukaa` 17,529; `Gigbanc` 15,787), which are correct
+and would be needlessly re-transcribed at ~$0.15 each.
+
+**Acceptance checklist**
+- [ ] `SELECT COUNT(*) FROM doc_cache WHERE char_count = 15000` → 0 after backfill.
+- [ ] `'2025 Africa Venture Capital Exit & Liquidity Report.pdf'` reports `char_count` well above
+      15,000 and a live read at `offset=12000` returns a "more characters" marker.
+- [ ] The 4 `kind='vision'` rows are byte-identical before and after (no re-transcription billed).
+- [ ] A fresh `/Dot Dump` ingest still extracts 5-20 facts (the extraction slice is unchanged).
+
+**UX impact:** invisible except that Dot stops confidently reporting the second half of a memo as
+absent. No interface change.
+**Cost impact:** $0 — backfill is Dropbox bandwidth and local parsing. `doc_cache` grows by roughly
+1-2 MB. Ingest cost is unchanged: the same 15,000-char slice still goes to Claude.
+**Effort:** 2 hours including the backfill run.
+
+---
+
+## WS-18 — Make the trial survivable and measurable (F-37, F-40; D-12)
+
+**Goal:** two weeks of use cannot be silently ended by a dead store or a dead API key, and it
+produces evidence rather than an impression.
+
+**Confirmed decisions:** D-12 (pending) for part C. Parts A and B are decision-independent.
+
+### A. Backups (F-40)
+
+`backup.sh` in the repo root, run by cron at 03:00 daily, alongside the existing ingest entry:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+STAMP=$(date +%Y%m%d)
+mkdir -p backups
+# .backup is WAL-safe and does not block the running bot; a plain cp of dot.db is not.
+venv/bin/python -c "import sqlite3,sys; s=sqlite3.connect('dot.db'); d=sqlite3.connect(sys.argv[1]); s.backup(d); d.close(); s.close()" "backups/dot-$STAMP.db"
+tar czf "backups/sessions-$STAMP.tar.gz" sessions/
+ls -1t backups/dot-*.db        | tail -n +15 | xargs -r rm
+ls -1t backups/sessions-*.tar.gz | tail -n +15 | xargs -r rm
+```
+
+Then an offsite copy of the newest pair into Dropbox `/Dot Backups/` via the **already
+authenticated** `dropbox` client — no new dependency, no new account, no new cost line. Add
+`backups/` to `.gitignore`.
+
+**`chroma_db/` is deliberately not backed up.** It is fully derivable from `dot.db` via
+`migrate_sqlite_to_chroma` (memory.py:221) using free local embeddings. That is what keeps the
+backup at ~9.4 MB/day instead of ~80 MB, and it is why the daily Dropbox copy is free. Document the
+restore in README: copy `dot.db` back, delete `chroma_db/`, start the bot — `migrate_sqlite_to_chroma`
+rebuilds the index on boot. **Test the restore once, into a scratch directory, before the trial
+starts.** An untested backup is not a backup — `chroma_db.corrupt/` is the local proof.
+
+While here (Joey's standing approval, memory note 2026-06-12, now well past its date): delete
+`chroma_db.corrupt/` (51 MB) and `dot.db.bak-2014` (5.5 MB). Also `session.json.bak-broken`
+(43 KB, superseded by `sessions/`). Confirm with Joey before deleting — the approval is two months
+old.
+
+### B. Honest failure alerts (F-37) — reframed
+
+This is explicitly **not** "add a balance check" and **not** auto-top-up. Joey letting the credits
+lapse was a deliberate decision. The defect is that Dot's only signal was
+`"⚠️ Couldn't prep 'X' — will retry."` — which named neither the cause nor the fact that it was
+permanent — followed by 911 silent failures over 9 days. Two changes:
+
+1. WS-14 step 6 already fixes the message text for the prep path.
+2. Add a module-level consecutive-permanent-failure counter in `agent.py`, incremented wherever an
+   API call raises with `"credit balance"` or an auth error. On the transition from 0 → 1, DM once:
+   *"Dot can't reach the Claude API — [verbatim error]. Nothing will work until this is resolved.
+   I won't message again about this."* Reset to 0 on the next success. One message per outage, ever,
+   naming the real cause.
+
+### C. `/wrong` — the trial's evidence log (D-12)
+
+Additive table, mirroring the `procedures` shape:
+
+```sql
+CREATE TABLE IF NOT EXISTS feedback (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    quoted_text  TEXT DEFAULT '',
+    reason       TEXT DEFAULT '',
+    created_at   TEXT DEFAULT (datetime('now'))
+);
+```
+
+`cmd_wrong` follows `cmd_log`'s handler shape (agent.py:1174), reads
+`update.message.reply_to_message.text` for the quoted output, stores it with the optional reason,
+and replies with a one-line confirmation. **No API call** — this must keep working when credits are
+out, which is precisely when Joey most wants to record that something is broken. Register in
+`main()` and `_post_init`'s `set_my_commands` list alongside the others.
+
+At the end of the fortnight, `SELECT * FROM feedback ORDER BY created_at` is the input to Phase 1.
+
+**Acceptance checklist**
+- [ ] `backup.sh` run manually produces both files; `venv/bin/python -c "import sqlite3;
+      sqlite3.connect('backups/dot-<stamp>.db').execute('SELECT COUNT(*) FROM memories')"` returns 10,779.
+- [ ] Restore rehearsal in a scratch dir: copy the backup in, delete `chroma_db/`, boot, confirm
+      `migrate_sqlite_to_chroma` reindexes and `search_memory` returns results.
+- [ ] Backup runs while the bot is live without a "database is locked" error (WAL + `.backup`).
+- [ ] Retention keeps exactly 14 of each; day 15 prunes the oldest.
+- [ ] The Dropbox copy lands in `/Dot Backups/` and is not ingested by `ingest.py` (it watches
+      `/Dot Dump` only — verify, don't assume).
+- [ ] With an invalid API key, exactly one DM arrives naming the real error; a second failure two
+      minutes later is silent.
+- [ ] `/wrong too vague` in reply to a Dot message writes a row including the quoted text — and
+      still works with the API key unset.
+
+**UX impact:** additive only. One new command, and outage messages that state the actual cause.
+**Cost impact:** **$0.** `cron` + `tar` + existing Dropbox auth + one `sqlite3` table. `/wrong`
+makes no API call. Net disk change is *negative* after the ~57 MB of stale-artifact cleanup.
+**Effort:** 3-4 hours including the restore rehearsal.
+
+---
+
+## WS-19 — A narrow test file for Phase-0 logic only (F-41)
+
+**Goal:** the specific bugs fixed in WS-14 to WS-17 cannot silently return. Deliberately **not** a
+test suite for Dot — that is Phase 1, and building one now would be exactly the "keep building"
+trap this plan exists to avoid.
+
+**Confirmed decisions:** none needed.
+
+Single file `tests/test_gate.py`, `pytest` only (dev-only, add to `requirements.txt` under a
+commented `# dev` section — free, no runtime dependency). No CI, no fixtures, no mocking of the
+Anthropic client. Only pure functions, run with `venv/bin/python -m pytest tests/ -q`:
+
+- **WS-14 event filtering** — extract the classification into a module-level helper
+  `_is_preppable(event, window_start, window_end, internal_domains)` returning `(bool, reason)`, so
+  it is testable without the Calendar API. Cases: all-day event → False; timed event outside the
+  window but overlapping it → False; timed event starting inside → True; internal-only attendees →
+  False; malformed `dateTime` → False. Feed it the real Aug 7 event shape.
+- **WS-14 mute matching** — `is_prep_muted` against an in-memory `sqlite3.connect(":memory:")`:
+  exact event id, case-insensitive title substring, a 2-char pattern must not match (guards against
+  a stray mute silencing everything).
+- **WS-16 threshold** — a fake results dict with the measured distances (0.318, 0.493, 1.382,
+  1.778) filters to exactly the expected survivors; empty `distances` falls through to prior
+  behavior.
+- **WS-15 empty response** — a stub object whose `.content` holds only a thinking-shaped block
+  makes `response_text` return `""` and `response_text_checked` log an error.
+- **WS-17 paging** — a 15,000-char body at `offset=12000` emits no "more characters" marker
+  (documents the bug); a 40,000-char body at the same offset does.
+
+Roughly 12 tests. If a test needs a running bot, a network call, or a real API key, it does not
+belong in this file.
+
+**UX impact:** none — test-only, no runtime code path changes beyond extracting `_is_preppable`,
+which is a pure refactor covered by its own tests.
+**Cost impact:** $0. `pytest` is free and dev-only.
+**Effort:** 2 hours.
+
+---
+
+# PHASE 1 — Deferred until the trial reports. Do not start these.
+
+Listed so they are not lost, each with the trigger that would promote it. **None of these should be
+touched during the two weeks.**
+
+| Item | Origin | Promote when |
+|---|---|---|
+| Deal pipeline: use it, redesign it, or remove it | F-38 (`deals` = 0 rows) | Joey decides — this is a product question about whether he wants a CRM at all, and two weeks of use is the right way to answer it. Do not guess. Note WS-9/D-5's fact-tagging has been inert since it shipped. |
+| Remove `get_stale_deals` (memory.py:306) | F-39 | Bundle with whatever the deals decision turns out to be — it was the morning briefing's only caller. |
+| General test suite | F-41 | After WS-19 proves the pattern and the trial shows which paths matter. |
+| Morning briefing v2 | removed in `12cb981` | Only if Joey misses it during the trial. Do not rebuild on spec — the removed version is the one that produced the four-draft output. |
+| Reminders v2 | removed in `12cb981` | Same. The `reminders` table was deliberately left in `dot.db`, so nothing is lost. |
+| Ingest `/Dot Dump` throughput, deck transcription tuning | WS-12/WS-13 follow-ons | Only if `/wrong` rows point at document reads. |
+| Whatever the `feedback` table says | WS-18C | Day 15. This is the point of the exercise. |
+
+---
+
+## Execution order
+
+1. **WS-16 step 1** — five lines, no decision needed, immediately removes ~4k tokens of noise per
+   turn. Do this first; it is the cheapest visible improvement in the plan.
+2. **WS-18 part A (backups) + the restore rehearsal** — before anything touches Chroma or
+   `doc_cache`. Nothing else should run against the data stores until a tested backup exists.
+3. **WS-15** — small, decision-independent, and WS-14's prep call depends on its token budgets.
+4. **WS-14** — the main event. Needs D-10 for steps 4 and 7; steps 1-3, 5, 6 can start now.
+5. **WS-17** — independent; slot it anywhere after step 2.
+6. **WS-16 steps 2-4** — needs D-11, and needs backups (step 2) in place before the reindex.
+7. **WS-18 parts B and C** — B is quick; C needs D-12.
+8. **WS-19** — last, against the finished behavior.
+
+Then stop. Top up credits, run for two weeks, use `/wrong`, and do not open the editor. The next
+plan should be written from the `feedback` table, not from a backlog.
+
+**Open decisions blocking full execution: D-10, D-11, D-12.** Roughly 60% of Phase 0 can proceed
+without any of them.
