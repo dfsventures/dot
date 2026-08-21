@@ -2,7 +2,44 @@
 
 ## Planned
 
-*(nothing currently planned)*
+**Phase 0 — correctness gate, before the two-week trial.** See `docs/IMPLEMENTATION_PLAN.md`
+(2026-08-20 evening review, WS-14 to WS-19). Nothing here adds a feature; every item removes a wrong
+output, prevents silent data loss, or captures evidence.
+
+- **WS-14** — Meeting prep fires only on real, timed, external meetings, and "stop prepping this"
+  actually stops it (persistent mute table + tool). Fixes the Aug 7 failure that ended usage.
+- **WS-15** — Explicit `thinking` parameter and adequate token budgets on every one-shot Claude
+  call; a truncated or thinking-only response can no longer pass as a valid empty result.
+- **WS-16** — Relevance floor on memory retrieval; the 7,127-row Africa Big Deal spreadsheet moves
+  behind an explicit search tool instead of being injected on every turn.
+- **WS-17** — `doc_cache` stores the full parse instead of the 15,000-char ingest truncation.
+- **WS-18** — Nightly backups of `dot.db` + `sessions/`, honest API-outage alerts, and a `/wrong`
+  command to log bad outputs during the trial.
+- **WS-19** — A narrow test file covering only the above.
+
+**Then: two weeks of use with no development.** Phase 1 is written from what the trial reports, not
+from a backlog.
+
+---
+
+## Removed
+
+### Follow-up reminders ✗ — removed 2026-08-20 (`12cb981`)
+
+`set_reminder` / `list_reminders` / `delete_reminder`, the 60-second JobQueue checker, and the
+`reminders` table were removed from the codebase. The table itself is left in place on any existing
+`dot.db` (not dropped), so no data was lost.
+
+### Morning briefing ✗ — removed 2026-08-20 (`12cb981`)
+
+The daily 08:00 proactive digest (calendar, unread email, reminders due, stale deal alerts, news via
+web search) was removed, along with the "Stale deal alerts in morning briefing" section that shipped
+2026-06-24. `get_stale_deals` in `memory.py` is now dead code with no callers.
+
+> Both entries were listed under "Shipped" here until 2026-08-20, days after the code was deleted.
+> Corrected during the 2026-08-20 evening review (F-39). The removed briefing is also the feature
+> that produced the captured four-redundant-drafts output analysed in F-33 — do not rebuild it on
+> spec.
 
 ---
 
@@ -30,14 +67,6 @@ that Drive is never ingested made the Drive gap worth closing in the same pass.
 
 `search_drive` and `read_drive_file` tools mirror the Dropbox pair using the `drive.readonly` scope. Supports Google Docs, Sheets, and Slides (exported as text), plus PDF, DOCX, TXT, MD, and CSV files stored in Drive. Useful for documents and shared files that live in Drive rather than Dropbox.
 
-### Follow-up reminders ✓ — 2026-06-11
-
-Reminders stored in `dot.db` with a `due_at` timestamp. A JobQueue job checks every 60 seconds and delivers due reminders as Telegram messages. Set naturally: "remind me to follow up with X in two weeks." Three tools: `set_reminder`, `list_reminders`, `delete_reminder`.
-
-### Morning briefing ✓ — 2026-06-11
-
-Daily proactive Telegram message at a configurable time (`BRIEFING_TIME` in `.dot.env`, default `08:00` Toronto). Content: today's calendar, unread emails, reminders due today, stale deal alerts, and top news headlines via web search. Formatted by Claude for readability.
-
 ### Gmail drafts ✓ — 2026-06-11
 
 `create_gmail_draft` tool creates a draft for Joey to review and send — never auto-sends. Reads thread context first so the draft has full background. Requires `gmail.compose` OAuth scope (re-run `auth_work.py` after deleting `token_work.pickle`).
@@ -46,17 +75,26 @@ Daily proactive Telegram message at a configurable time (`BRIEFING_TIME` in `.do
 
 Lightweight CRM in `dot.db`: company, stage (`sourcing` → `first_call` → `due_diligence` → `passed` / `invested`), last touchpoint, next action, notes. Three tools: `update_deal`, `get_deal_info`, `list_deals`. Queryable in natural language.
 
+> **Annotation (2026-08-20, F-38):** `SELECT COUNT(*) FROM deals` returns **0**. The tools work but
+> have never been used, so everything built on top of them — including the fact-tagging below — has
+> been inert since it shipped. Whether to use, redesign, or remove this is a product question
+> deferred to Phase 1.
+
 ### Voice messages ✓ — 2026-06-11
 
 Telegram voice notes transcribed locally with Whisper (`tiny` model, ~75 MB, CPU-only, no API cost). Transcript echoed back in italics then passed to the existing agent loop. Requires `ffmpeg` system package and `openai-whisper` Python package.
 
-### Stale deal alerts in morning briefing ✓ — 2026-06-24
-
-Morning briefing now includes a "Needs attention" section for deals in active stages with no update in 14+ days. One SQL query on the deals table; section is omitted entirely when the pipeline is current.
-
 ### Meeting prep brief ✓ — 2026-06-24
 
 JobQueue job runs every 5 minutes. When a calendar event with external attendees is 25–35 minutes away, Dot sends a prep brief pulling from Granola (previous call notes) and Gmail (recent threads). Deduped by event ID across the session.
+
+> **Correction (2026-08-20):** as shipped, this is unreliable and is the reason usage stopped on
+> Aug 7. Google Calendar's `timeMin`/`timeMax` is an *overlap* filter, not "starts within," so an
+> all-day event matches every 5-minute tick for its whole duration; the "external attendee" check
+> only tests work-domain email, so a family member on a personal address counts the same as a
+> founder; the dedup entries expire after 2 hours, so long events re-fire all day; and nothing said
+> in Telegram reaches the job at all — it reads no table, session, or memory, so "Got it, noted"
+> was never backed by anything. Findings F-29 to F-32; fixed by WS-14.
 
 ### WhatsApp forwarding via `/log` ✓ — 2026-06-24
 
@@ -65,6 +103,11 @@ JobQueue job runs every 5 minutes. When a calendar event with external attendees
 ### Deal + memory auto-linking in ingest ✓ — 2026-06-24 (tag made real 2026-07-21, WS-9)
 
 When `ingest.py` extracts facts from a document, it checks each fact against active deal company names and tags matching memories with `deal:<company>`. `get_deal_info` now surfaces the 10 most recent ingested-document facts tagged for that company under a "From ingested documents" section, so deal lookups get progressively richer as documents are ingested — closing the gap flagged in the 2026-07-07 review (F-15).
+
+> **Annotation (2026-08-20, F-38):** the mechanism is correct but has never fired. With `deals`
+> empty, `list_deals()` returns nothing for `ingest.py` to match against, so none of the 211
+> ingested files has ever received a `deal:<company>` tag. "Progressively richer" remains
+> aspirational, now for a data reason rather than a code one.
 
 ### Named conversation sessions ✓ — 2026-06-26
 
