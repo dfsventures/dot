@@ -1,6 +1,7 @@
 import os, json, base64, pickle, io, asyncio, glob, re, shutil
 from anthropic import Anthropic
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -57,6 +58,17 @@ from memory import (
 
 # Run migration on startup to catch any memories added before vector search
 migrate_sqlite_to_chroma()
+
+async def send_markdown(sender, text: str):
+    """sender: async callable shaped like `reply_text`/`send_message` — takes
+    (text, parse_mode=...). Tries Telegram Markdown so the model's **bold**/bullets
+    actually render instead of showing as literal asterisks; falls back to plain
+    text if the output isn't valid Markdown (an unmatched */_/`/[ would otherwise
+    make Telegram reject the whole message)."""
+    try:
+        await sender(text, parse_mode="Markdown")
+    except BadRequest:
+        await sender(text, parse_mode=None)
 
 def extract_and_save_memories(conversation):
     if len(conversation) < 4:
@@ -1142,7 +1154,8 @@ async def _process_message(update: Update, user_text: str):
         save_session()
 
         for i in range(0, len(final), 4000):
-            await update.message.reply_text(final[i:i+4000])
+            chunk = final[i:i+4000]
+            await send_markdown(update.message.reply_text, chunk)
     except Exception:
         # Roll back to the last clean on-disk save so the next turn doesn't
         # inherit a half-written assistant message and continue it mid-thought.
@@ -1600,7 +1613,12 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
                 continue
             if text:
                 header = f"Prep — {title} (in ~30 min)\n\n"
-                await context.bot.send_message(chat_id=YOUR_USER_ID, text=(header + text)[:4000])
+                chunk = (header + text)[:4000]
+                await send_markdown(
+                    lambda t, parse_mode=None: context.bot.send_message(
+                        chat_id=YOUR_USER_ID, text=t, parse_mode=parse_mode),
+                    chunk,
+                )
                 mark_prepped(event_id, occurrence, outcome="sent")
                 _prep_notified.discard(event_id)
         except Exception as e:
