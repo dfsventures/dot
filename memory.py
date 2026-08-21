@@ -69,6 +69,19 @@ conn.executescript("""
         last_read_at TEXT,
         UNIQUE (source, file_key)
     );
+    CREATE TABLE IF NOT EXISTS prep_log (
+        event_id     TEXT NOT NULL,
+        occurrence   TEXT NOT NULL DEFAULT '',   -- event start ISO — a recurring series preps per occurrence
+        prepped_at   TEXT DEFAULT (datetime('now')),
+        outcome      TEXT DEFAULT 'sent',        -- 'sent' | 'skipped' | 'muted'
+        PRIMARY KEY (event_id, occurrence)
+    );
+    CREATE TABLE IF NOT EXISTS prep_mutes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern    TEXT NOT NULL,                -- event id, or a case-insensitive substring of the title
+        reason     TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
 """)
 conn.commit()
 
@@ -126,6 +139,49 @@ def save_cached_doc(source: str, file_key: str, revision: str, filename: str,
         conn.commit()
     except Exception as e:
         print(f"doc_cache write error: {e}")
+
+def was_prepped(event_id: str, occurrence: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM prep_log WHERE event_id = ? AND occurrence = ?", (event_id, occurrence)
+    ).fetchone() is not None
+
+def mark_prepped(event_id: str, occurrence: str, outcome: str = "sent"):
+    conn.execute(
+        "INSERT OR REPLACE INTO prep_log (event_id, occurrence, outcome) VALUES (?, ?, ?)",
+        (event_id, occurrence, outcome))
+    # Housekeeping: keep prep_log from growing without bound.
+    conn.execute("DELETE FROM prep_log WHERE prepped_at < datetime('now', '-90 days')")
+    conn.commit()
+
+def add_prep_mute(pattern: str, reason: str = "") -> str:
+    conn.execute(
+        "INSERT INTO prep_mutes (pattern, reason) VALUES (?, ?)", (pattern, reason)
+    )
+    conn.commit()
+    return pattern
+
+def list_prep_mutes() -> list:
+    rows = conn.execute(
+        "SELECT id, pattern, reason, created_at FROM prep_mutes ORDER BY id DESC"
+    ).fetchall()
+    return [{"id": r[0], "pattern": r[1], "reason": r[2], "created_at": r[3]} for r in rows]
+
+def delete_prep_mute(mute_id: int) -> bool:
+    row = conn.execute("SELECT id FROM prep_mutes WHERE id = ?", (mute_id,)).fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM prep_mutes WHERE id = ?", (mute_id,))
+    conn.commit()
+    return True
+
+def is_prep_muted(event_id: str, title: str) -> bool:
+    """True if any mute row matches this event by id or by case-insensitive title substring."""
+    t = (title or "").lower()
+    for (pattern,) in conn.execute("SELECT pattern FROM prep_mutes").fetchall():
+        p = pattern.lower()
+        if p == event_id.lower() or (len(p) >= 3 and p in t):
+            return True
+    return False
 
 def delete_memory(content: str) -> bool:
     """Delete a memory from SQLite AND ChromaDB. Returns True if found."""

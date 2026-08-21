@@ -51,6 +51,7 @@ from memory import (
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
+    was_prepped, mark_prepped, add_prep_mute, list_prep_mutes, delete_prep_mute, is_prep_muted,
 )
 
 # Run migration on startup to catch any memories added before vector search
@@ -492,6 +493,34 @@ def save_procedure(trigger: str, procedure: str) -> str:
     _save_procedure(trigger, procedure)
     return f"Saved procedure for future '{trigger}' situations."
 
+def mute_meeting_prep(pattern: str, reason: str = "") -> str:
+    """Stop sending automatic prep briefs for a meeting. `pattern` is an event title or a
+    distinctive substring of one. Never raises — returns a string like every other tool."""
+    try:
+        add_prep_mute(pattern, reason)
+        return f"Muted automatic prep briefs for anything matching '{pattern}'. This is persistent."
+    except Exception as e:
+        return f"Mute error: {e}"
+
+def list_meeting_prep_mutes() -> str:
+    try:
+        mutes = list_prep_mutes()
+        if not mutes:
+            return "No meeting prep mutes set."
+        return "\n".join(
+            f"{m['id']}. '{m['pattern']}'" + (f" — {m['reason']}" if m['reason'] else "")
+            for m in mutes
+        )
+    except Exception as e:
+        return f"List mutes error: {e}"
+
+def unmute_meeting_prep(mute_id: int) -> str:
+    try:
+        ok = delete_prep_mute(int(mute_id))
+        return f"Unmuted #{mute_id}." if ok else f"No mute found with id {mute_id}."
+    except Exception as e:
+        return f"Unmute error: {e}"
+
 _MIN_TEXT_CHARS = 200  # same threshold ingest.py uses to detect an image-only PDF
 
 def _pdf_text_or_marker(content: bytes, label: str) -> str:
@@ -772,6 +801,26 @@ TOOLS = [
             "trigger":   {"type": "string", "description": "Short description of the situation this applies to, e.g. 'Granola note title doesn't match any calendar event'"},
             "procedure": {"type": "string", "description": "The approach that worked, written so future-you can follow it directly"}
         }, "required": ["trigger", "procedure"]}
+    },
+    {
+        "name": "mute_meeting_prep",
+        "description": "Stop sending automatic pre-meeting prep briefs for a meeting. Call this in the same turn whenever Joey says a prep brief was unwanted, wrong, or should stop — for a specific meeting or for a category like personal events. This is persistent (survives restarts) — it is the only way to make 'stop prepping X' actually stick.",
+        "input_schema": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Event title, a distinctive case-insensitive substring of one, or an event ID"},
+            "reason":  {"type": "string", "description": "Why this is being muted"}
+        }, "required": ["pattern"]}
+    },
+    {
+        "name": "list_meeting_prep_mutes",
+        "description": "List all active meeting-prep mutes, with their numbers.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "unmute_meeting_prep",
+        "description": "Remove a meeting-prep mute by its number (get the number from list_meeting_prep_mutes first).",
+        "input_schema": {"type": "object", "properties": {
+            "mute_id": {"type": "integer", "description": "The mute's number from list_meeting_prep_mutes"}
+        }, "required": ["mute_id"]}
     }
 ]
 
@@ -795,6 +844,9 @@ TOOL_FUNCTIONS = {
     "list_deals":           list_deals,
     "search_memory":        search_memory,
     "save_procedure":       save_procedure,
+    "mute_meeting_prep":       mute_meeting_prep,
+    "list_meeting_prep_mutes": list_meeting_prep_mutes,
+    "unmute_meeting_prep":     unmute_meeting_prep,
 }
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -814,6 +866,7 @@ Your tools and what they contain:
 - update_deal / get_deal_info / list_deals: deal pipeline (stages: sourcing, first_call, due_diligence, passed, invested)
 - search_memory: actively search long-term memory when passive retrieval may have missed something
 - save_procedure: save a reusable HOW-TO when you work out a non-obvious multi-step approach likely to recur — not for facts (those are captured automatically) and not for one-off tasks
+- mute_meeting_prep / list_meeting_prep_mutes / unmute_meeting_prep: control automatic pre-meeting prep briefs. If Joey ever says a prep brief was unwanted, wrong, or should stop — for a specific meeting or for a category like personal events — call mute_meeting_prep in that same turn. Do not reply "noted" without calling it; nothing you say is remembered by the prep job unless you write it here.
 If Joey asks to be prepped for a meeting or asks for background on a person or company before a call, proactively search Granola, Gmail, Dropbox, and Drive for context and produce a tight prep brief without being asked to use specific tools.
 
 When a question involves a person or company, search Granola first (most recent call context),
@@ -989,8 +1042,7 @@ def run_tool(name: str, tool_input: dict):
         return f"Tool error: {e}", True
 
 _whisper_model = None
-_prepped_events: dict = {}   # event_id -> datetime added (successful sends only)
-_prepping_now:  set = set()  # event_ids currently being prepped (in-flight guard)
+_prepping_now:  set = set()  # event_ids currently being prepped (in-flight guard, in-memory only)
 _prep_notified: set = set()  # event_ids already sent a "couldn't prep" DM this window
 _meeting_prep_cal_notified = False  # avoids a DM every 5-min tick during a calendar outage
 _INTERNAL_DOMAINS = {'dfslab.net', 'dfs.vc'}
@@ -1173,6 +1225,29 @@ async def cmd_forget_procedure(update, context):
     except Exception:
         await update.message.reply_text("Usage: /forget_procedure [number from /procedures]")
 
+async def cmd_mutes(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    mutes = list_prep_mutes()[:20]
+    if not mutes:
+        await update.message.reply_text("No meeting prep mutes set.")
+        return
+    lines = [
+        f"{i+1}. '{m['pattern']}'" + (f" — {m['reason']}" if m['reason'] else "")
+        for i, m in enumerate(mutes)
+    ]
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+async def cmd_unmute(update, context):
+    if update.effective_user.id != YOUR_USER_ID: return
+    mutes = list_prep_mutes()[:20]
+    try:
+        n = int(context.args[0]) - 1
+        target = mutes[n]
+        await asyncio.to_thread(delete_prep_mute, target["id"])
+        await update.message.reply_text(f"Unmuted: '{target['pattern']}'")
+    except Exception:
+        await update.message.reply_text("Usage: /unmute [number from /mutes]")
+
 async def cmd_newsession(update, context):
     global conversation_history
     if update.effective_user.id != YOUR_USER_ID: return
@@ -1329,10 +1404,6 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
     window_start = now + timedelta(minutes=25)
     window_end   = now + timedelta(minutes=35)
 
-    cutoff = now - timedelta(hours=2)
-    for eid in [k for k, t in _prepped_events.items() if t < cutoff]:
-        del _prepped_events[eid]
-
     global _meeting_prep_cal_notified
     try:
         cal_result = await asyncio.to_thread(
@@ -1355,7 +1426,26 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
 
     for event in events:
         event_id = event.get('id', '')
-        if event_id in _prepped_events or event_id in _prepping_now:
+
+        # F-29: timeMin/timeMax on the Calendar API is an overlap filter (event.end > timeMin
+        # AND event.start < timeMax), not "starts within this window" — an all-day event
+        # matches every 5-minute tick for its entire duration. Filter client-side.
+        start = event.get('start', {})
+        if 'dateTime' not in start:
+            continue                      # all-day / date-only event — no "30 minutes before" exists
+        try:
+            start_dt = datetime.fromisoformat(start['dateTime'])
+        except ValueError:
+            continue
+        if not (window_start <= start_dt <= window_end):
+            continue                      # overlapping, but not starting in this window (F-29)
+        occurrence = start_dt.isoformat()
+
+        title = event.get('summary', 'Untitled')
+        if was_prepped(event_id, occurrence) or event_id in _prepping_now:
+            continue
+        if is_prep_muted(event_id, title):
+            mark_prepped(event_id, occurrence, outcome="muted")
             continue
 
         attendees = event.get('attendees', [])
@@ -1368,7 +1458,6 @@ async def check_meeting_prep(context: ContextTypes.DEFAULT_TYPE):
         if not external:
             continue
 
-        title  = event.get('summary', 'Untitled')
         names  = [a.get('displayName') or a.get('email', '') for a in external]
         emails = [a.get('email', '') for a in external]
 
@@ -1387,6 +1476,10 @@ Write a tight prep brief:
 - Key context from previous interactions (calls, emails)
 - Any relevant documents found (deck highlights, memo conclusions)
 - 1-2 suggested talking points or things to follow up on
+
+If this is not a business meeting — a personal appointment, a family event, a travel or
+out-of-office block, a focus/hold block, or anything where a prep brief would be unwanted —
+respond with exactly SKIP and nothing else. Do not explain. Do not write a brief anyway.
 
 Start immediately with the brief — no preamble, no "I have enough to write...", no "Here's the full picture". Just the content.
 Plain prose and bullets. No emoji headers. No markdown section dividers. Write like a sharp colleague gave you a quick verbal rundown."""
@@ -1426,16 +1519,32 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
                 response = await asyncio.to_thread(_prep_call, prep_container_id)
                 prep_container_id = getattr(response, 'container_id', None) or prep_container_id
             text = " ".join(b.text for b in response.content if b.type == "text").strip()
+            if text.upper().startswith("SKIP"):
+                # Output-side gate (D-10c): the model's own judgment on the Aug 7 evidence was
+                # correct and was simply discarded — this is where it now gets acted on. The
+                # auto-mute stops a multi-day/long event from burning an API call every tick.
+                mark_prepped(event_id, occurrence, outcome="skipped")
+                add_prep_mute(event_id, reason=f"auto: model judged '{title}' non-business")
+                logging.info(f"Meeting prep: skipped non-business event '{title}'")
+                continue
             if text:
                 header = f"Prep — {title} (in ~30 min)\n\n"
                 await context.bot.send_message(chat_id=YOUR_USER_ID, text=(header + text)[:4000])
-                _prepped_events[event_id] = now
+                mark_prepped(event_id, occurrence, outcome="sent")
                 _prep_notified.discard(event_id)
         except Exception as e:
             logging.error(f"Meeting prep error for '{title}': {e}")
             if event_id not in _prep_notified:
                 _prep_notified.add(event_id)
-                await _notify_owner(context, f"⚠️ Couldn't prep '{title}' — will retry.")
+                msg = str(e)
+                if "credit balance" in msg or "authentication" in msg.lower():
+                    await _notify_owner(
+                        context,
+                        f"⚠️ Dot can't reach the Claude API: {msg[:300]}\n"
+                        f"Prep for '{title}' was skipped and will keep failing until this is resolved."
+                    )
+                else:
+                    await _notify_owner(context, f"⚠️ Couldn't prep '{title}': {msg[:300]} — will retry.")
         finally:
             _prepping_now.discard(event_id)
 
@@ -1454,6 +1563,8 @@ async def _post_init(app):
         BotCommand("forget",     "Delete a memory by number"),
         BotCommand("newsession", "Clear current conversation history"),
         BotCommand("search",     "Search long-term memory"),
+        BotCommand("mutes",      "List meeting-prep mutes"),
+        BotCommand("unmute",     "Remove a meeting-prep mute by number"),
     ])
 
 def main():
@@ -1468,6 +1579,8 @@ def main():
     app.add_handler(CommandHandler("forget",     cmd_forget))
     app.add_handler(CommandHandler("procedures",       cmd_procedures))
     app.add_handler(CommandHandler("forget_procedure", cmd_forget_procedure))
+    app.add_handler(CommandHandler("mutes",      cmd_mutes))
+    app.add_handler(CommandHandler("unmute",     cmd_unmute))
     app.add_handler(CommandHandler("newsession", cmd_newsession))
     app.add_handler(CommandHandler("log",        cmd_log))
     app.add_handler(CommandHandler("search",     cmd_search))
