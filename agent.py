@@ -47,6 +47,7 @@ dbx = dbx_lib.Dropbox(
 from memory import (
     save_memory, delete_memory, get_all_memories,
     retrieve_relevant_memories, migrate_sqlite_to_chroma, parse_json_array, response_text,
+    response_text_checked,
     upsert_deal as _upsert_deal, get_deal as _get_deal, list_deals as _list_deals,
     save_procedure as _save_procedure, get_all_procedures, delete_procedure as _delete_procedure,
     retrieve_relevant_procedures, get_cached_doc, save_cached_doc,
@@ -64,11 +65,12 @@ def extract_and_save_memories(conversation):
     ])
     try:
         response = client.messages.create(
-            model="claude-sonnet-5", max_tokens=1000,
+            model="claude-sonnet-5", max_tokens=1500,
+            thinking={"type": "disabled"},
             system='Extract facts worth remembering. Return ONLY a JSON array of strings. If nothing, return []. Focus on people, companies, deals, preferences.',
             messages=[{"role": "user", "content": convo_text}]
         )
-        facts = parse_json_array(response_text(response))
+        facts = parse_json_array(response_text_checked(response, "extract_and_save_memories"))
         print(f"Extracted facts: {facts}")
         for fact in facts:
             if fact and len(fact) > 10:
@@ -119,11 +121,14 @@ def compress_history(conversation: list) -> list:
     ])
     try:
         r = client.messages.create(
-            model="claude-sonnet-5", max_tokens=600,
+            model="claude-sonnet-5", max_tokens=1500,
+            thinking={"type": "disabled"},
             system="Summarise this conversation history concisely, preserving all key facts, decisions, and context that would be needed to continue the conversation intelligently. Be dense — this replaces the full history.",
             messages=[{"role": "user", "content": convo_text}]
         )
-        summary = response_text(r).strip()
+        summary = response_text_checked(r, "compress_history").strip()
+        if not summary:
+            return conversation  # no summary → keep everything, never silently truncate
         summary_message = {
             "role": "user",
             "content": f"[Earlier conversation summary]\n{summary}"
@@ -132,11 +137,11 @@ def compress_history(conversation: list) -> list:
             "role": "assistant",
             "content": "Understood, I have the earlier context."
         }
-        print(f"Context compressed: {len(to_summarise)} messages → summary")
+        logging.info(f"Context compressed: {len(to_summarise)} messages → summary")
         return [summary_message, ack] + recent
     except Exception as e:
-        print(f"Compression error: {e}")
-        return recent  # Hard fallback: keep the safe window, drop the rest
+        logging.error(f"Compression error: {e}")
+        return conversation  # was: return recent — dropped all but 4 messages on any failure
 
 # ── GMAIL HELPERS ─────────────────────────────────────────────────────────────
 def _search_gmail_svc(svc, query, max_results=10):
@@ -942,7 +947,8 @@ def _with_cache_breakpoint(messages: list) -> list:
 def call_claude(container_id=None):
     kwargs = dict(
         model="claude-sonnet-5",
-        max_tokens=4096,
+        max_tokens=12000,
+        thinking={"type": "adaptive"},
         system=SYSTEM_BLOCKS,
         tools=TOOLS,
         messages=_with_cache_breakpoint(conversation_history),
@@ -1057,7 +1063,12 @@ async def _process_message(update: Update, user_text: str):
             response = await asyncio.to_thread(call_claude, container_id)
             container_id = getattr(response, 'container_id', None) or container_id
 
-        final = " ".join(b.text for b in response.content if b.type == "text") or "Done."
+        final = " ".join(b.text for b in response.content if b.type == "text").strip()
+        if not final:
+            logging.error(f"Empty final response (stop_reason={response.stop_reason})")
+            final = ("I hit my output limit before I could answer — the reasoning consumed the "
+                     "budget. Ask again, more narrowly." if response.stop_reason == "max_tokens"
+                     else "Done.")
         conversation_history.append({"role": "assistant", "content": final})
         save_session()
 
@@ -1182,11 +1193,12 @@ async def cmd_log(update, context):
         resp = await asyncio.to_thread(
             client.messages.create,
             model="claude-sonnet-5",
-            max_tokens=500,
+            max_tokens=1500,
+            thinking={"type": "disabled"},
             system='Extract facts worth remembering from this note or conversation. Return ONLY a JSON array of strings. Each fact must be self-contained. Focus on people, companies, deals, decisions, commitments. If nothing worth keeping, return [].',
             messages=[{"role": "user", "content": text}]
         )
-        facts = parse_json_array(response_text(resp))
+        facts = parse_json_array(response_text_checked(resp, "cmd_log"))
         saved = 0
         saved_facts = []
         for fact in facts:
@@ -1385,7 +1397,9 @@ Plain prose and bullets. No emoji headers. No markdown section dividers. Write l
         _prepping_now.add(event_id)
         try:
             def _prep_call(cid=None):
-                kw = dict(model="claude-sonnet-5", max_tokens=1000, tools=prep_tools, messages=msgs)
+                kw = dict(model="claude-sonnet-5", max_tokens=6000,
+                          thinking={"type": "adaptive"},
+                          tools=prep_tools, messages=msgs)
                 if cid:
                     kw["container_id"] = cid
                 return client.messages.create(**kw)

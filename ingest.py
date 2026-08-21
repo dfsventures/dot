@@ -253,6 +253,7 @@ def extract_facts_from_pdf_with_claude(content: bytes, filename: str) -> tuple[l
         response = client.messages.create(
             model="claude-sonnet-5",
             max_tokens=8000,
+            thinking={"type": "disabled"},
             system=PDF_EXTRACTION_SYSTEM,
             messages=[{
                 "role": "user",
@@ -311,6 +312,7 @@ def transcribe_pdf_with_claude(content: bytes, filename: str) -> str:
         response = client.messages.create(
             model="claude-sonnet-5",
             max_tokens=8000,
+            thinking={"type": "disabled"},
             system=TRANSCRIBE_ONLY_SYSTEM,
             messages=[{
                 "role": "user",
@@ -338,7 +340,8 @@ def extract_facts_with_claude(text: str, filename: str) -> list:
     try:
         response = client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=2000,
+            max_tokens=3000,
+            thinking={"type": "disabled"},
             system=EXTRACTION_SYSTEM,
             messages=[{
                 "role": "user",

@@ -343,6 +343,17 @@ def response_text(response) -> str:
     content[0] is often a ThinkingBlock, not the TextBlock — never index content[0] directly."""
     return next((b.text for b in response.content if b.type == "text"), "")
 
+def response_text_checked(response, label: str) -> str:
+    """response_text(), but loud when the model returned no text at all — a thinking-only or
+    max_tokens-truncated response looks identical to a legitimately empty answer (F-34)."""
+    text = response_text(response)
+    if not text.strip():
+        import logging
+        logging.error(
+            f"{label}: no text block in response (stop_reason={getattr(response, 'stop_reason', '?')}) "
+            f"— treating as failure, not as an empty result")
+    return text
+
 # ── JSON PARSING ──────────────────────────────────────────────────────────────
 def parse_json_array(raw: str) -> list:
     """Parse a JSON array from model output, tolerating markdown code fences."""
